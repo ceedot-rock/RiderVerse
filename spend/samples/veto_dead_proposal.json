@@ -1,0 +1,49 @@
+{
+  "label": "RiderXL DEAD PROPOSAL \u2014 vetoed, no spend executed, no receipt issued, no money moved",
+  "mode": "MOCK",
+  "network": "none",
+  "product": "RiderXL",
+  "proposal": {
+    "amount_cents": 24000,
+    "approvals": [
+      "corey"
+    ],
+    "created_at": "2026-10-05T22:47:58.367221+00:00",
+    "denials": [
+      "alice"
+    ],
+    "description": "RiderXL spend proposal: book the cabin, $240 split 3 ways",
+    "executed": false,
+    "group_id": "cabin-trip-oct",
+    "members": [
+      "corey",
+      "alice",
+      "bob"
+    ],
+    "policy": "unanimous",
+    "proposal_id": "sp_9ff2cdb47294",
+    "proposed_by": "corey",
+    "quote": {
+      "amount_cents": 24000,
+      "amount_usd": "240.00",
+      "fee_cents": 265,
+      "fee_source": "real:~/workspace/awlpay/server/fees.py",
+      "fee_status": "free",
+      "label": "RiderXL MOCK QUOTE \u2014 no real money, no chain interaction",
+      "mode": "MOCK",
+      "net_cents": 23735,
+      "network": "none",
+      "product": "RiderXL",
+      "rail": "tron-usdt",
+      "tier": "free"
+    },
+    "rail": "tron-usdt",
+    "status": "DEAD",
+    "status_reason": "unanimous veto: alice denied",
+    "votes": {
+      "alice": "deny",
+      "corey": "approve"
+    }
+  },
+  "receipt_issued": false
+}
