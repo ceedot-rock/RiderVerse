@@ -19,6 +19,7 @@ instead, produced by the server -- the agent never speaks to strangers.
 from __future__ import annotations
 
 import re
+import secrets
 import time
 
 AGENT_MEMBER_ID = "agent"
@@ -35,6 +36,16 @@ SPEND_KEYWORDS = (
     "book", "buy", "purchase", "pay", "send money", "order", "reserve",
     "subscribe", "wire", "transfer", "checkout",
 )
+# Review fix 2026-10-07: word-boundary regexes compiled from the keyword
+# list. The old `k in low` substring test over-triggered ("book" matched
+# "bookkeeper") and under-triggered on trivial spacing games. This is
+# still a heuristic — a determined obfuscator ("b o o k") beats any
+# keyword list; the hard guarantee is that NOTHING acts without an
+# approval, not that every phrasing is caught. Documented, not hidden.
+_SPEND_RES = [
+    re.compile(r"\bsend\s+money\b"),
+] + [re.compile(r"\b" + re.escape(k) + r"\b") for k in SPEND_KEYWORDS
+     if k != "send money"]
 
 
 class ScriptedResponder:
@@ -137,7 +148,9 @@ class RiderXL:
 
     # -- task cards --
     def _new_task(self, group: dict, kind: str, title: str, payload: dict) -> dict:
-        tid = f"task-{len(group['tasks']) + 1:03d}"
+        # Review fix 2026-10-07: random task ids (sequential ids leak
+# task count / creation order to any group reader).
+        tid = "task-" + secrets.token_hex(4)
         task = {"task_id": tid, "kind": kind, "title": title,
                 "status": "open", "created_ts": time.time(),
                 "payload": payload}
@@ -193,7 +206,7 @@ class RiderXL:
 
     # -- approval check-in (the anti-Instinct rule) --
     def _is_spend_like(self, low: str) -> bool:
-        return any(k in low for k in SPEND_KEYWORDS)
+        return any(rx.search(low) for rx in _SPEND_RES)
 
     def _approval_card(self, group, member, text) -> dict:
         request = re.sub(r"(?i)@agent\s*", "", text).strip()

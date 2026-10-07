@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 
 from .approve import (
@@ -38,6 +39,7 @@ class GroupSpendService:
         # permissions(member_id, action) -> bool; default permissive stub
         # inside ProposalStore until worker 1's identity/core.py lands.
         self.store = ProposalStore(permissions=permissions)
+        self._lock = threading.Lock()  # review fix 2026-10-07: serializes execute()
         self.client = client or MockAwlPayClient()
         self.seal_authority = seal_authority or SealAuthority()
         self.receipts_dir = receipts_dir or os.path.join(
@@ -69,18 +71,23 @@ class GroupSpendService:
 
         Raises SpendRefused unless status == APPROVED. Raises SpendRefused
         again on a second call (a proposal executes at most once).
-        """
-        p = self.store.get(proposal_id)
-        if p.status != STATUS_APPROVED:
-            raise SpendRefused(
-                "proposal %s is %s (%s) — threshold not met, no spend"
-                % (proposal_id, p.status, p.status_reason))
-        if p.executed:
-            raise SpendRefused("proposal %s already executed — one spend "
-                               "per approval" % proposal_id)
 
-        mock = self.client.execute(p.quote, description=p.description)
-        p._mark_executed()
+        Review fix 2026-10-07: the guard-check → execute → mark sequence
+        holds the service lock, so two concurrent callers cannot both pass
+        the already-executed check.
+        """
+        with self._lock:
+            p = self.store.get(proposal_id)
+            if p.status != STATUS_APPROVED:
+                raise SpendRefused(
+                    "proposal %s is %s (%s) — threshold not met, no spend"
+                    % (proposal_id, p.status, p.status_reason))
+            if p.executed:
+                raise SpendRefused("proposal %s already executed — one spend "
+                                   "per approval" % proposal_id)
+
+            mock = self.client.execute(p.quote, description=p.description)
+            p._mark_executed()
 
         seal_payload = {
             "product": "RiderXL",
@@ -122,8 +129,13 @@ class GroupSpendService:
         }
         path = os.path.join(self.receipts_dir,
                             "receipt_%s.json" % p.proposal_id)
-        with open(path, "w") as f:
+        # Review fix 2026-10-07: atomic receipt write (tmp+fsync+replace).
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(receipt, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         receipt["_file"] = path
         return receipt
 

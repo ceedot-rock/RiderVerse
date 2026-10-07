@@ -16,7 +16,8 @@ from ..seal import verify_with_key_hex
 
 @pytest.fixture
 def svc(tmp_path):
-    return GroupSpendService(receipts_dir=str(tmp_path / "receipts"))
+    return GroupSpendService(receipts_dir=str(tmp_path / "receipts"),
+                               permissions=lambda member_id, action: True)
 
 
 def _cabin(svc, members=("corey", "alice", "bob"), policy="majority"):

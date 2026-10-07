@@ -18,7 +18,7 @@ def _quote(cents=24000):
 
 @pytest.fixture
 def store():
-    return ProposalStore()
+    return ProposalStore(permissions=lambda member_id, action: True)
 
 
 def _propose(store, members=("a", "b", "c"), policy=POLICY_MAJORITY, **kw):

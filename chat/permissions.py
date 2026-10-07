@@ -111,12 +111,12 @@ def _user_seat(identity_id: str, label: str | None = None):
     return seat
 
 
-def _real_issue_group_seat(group_id, member_id=None, scopes=None):
+def _real_issue_group_seat(group_id):
     with _lock:
         return _riderxl_seat(group_id)
 
 
-def _real_issue_personal_seat(identity_id, label=None, scopes=None):
+def _real_issue_personal_seat(identity_id, label=None):
     with _lock:
         return _user_seat(identity_id, label)
 
@@ -213,11 +213,14 @@ def _stub_save(reg: dict) -> None:
 # public surface: real when available, stub otherwise
 # ---------------------------------------------------------------------------
 if _REAL:
-    def issue_group_seat(group_id, member_id=None, scopes=None):
+    # Review fix 2026-10-07: dropped the accepted-but-ignored
+    # `member_id`/`scopes` parameters (nothing ever passed them; scopes
+    # live on grants, not seats).
+    def issue_group_seat(group_id):
         """Return (creating if needed) the RiderXL group seat for a chat group."""
-        return _real_issue_group_seat(group_id, member_id, scopes)
+        return _real_issue_group_seat(group_id)
 
-    def issue_personal_seat(identity_id, label=None, scopes=None):
+    def issue_personal_seat(identity_id, label=None):
         """Return (creating if needed) the personal seat for a chat identity."""
         return _real_issue_personal_seat(identity_id, label)
 
@@ -256,11 +259,11 @@ else:
         "!!! Access control is a permissive in-memory stub. Set\n"
         "!!! RIDERXL_ALLOW_STUB=1 to acknowledge, or fix the import.\n")
 
-    def issue_group_seat(group_id, member_id=None, scopes=None):
+    def issue_group_seat(group_id):
         return {"seat": "group", "group_id": group_id, "stub": True,
                 "issued_ts": time.time()}
 
-    def issue_personal_seat(identity_id, label=None, scopes=None):
+    def issue_personal_seat(identity_id, label=None):
         return {"seat": "personal", "identity_id": identity_id, "stub": True,
                 "issued_ts": time.time()}
 

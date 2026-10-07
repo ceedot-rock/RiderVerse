@@ -71,7 +71,19 @@ class SealAuthority:
 
 def verify_with_key_hex(envelope: dict, verify_key_hex: str) -> bool:
     """Verify an envelope against an embedded/explicit verify key hex.
-    Never raises — False on any problem."""
+    Never raises — False on any problem.
+
+    TRUST CAVEAT (review fix 2026-10-07, documented loudly per KIMI):
+    this verifies the seal against the key EMBEDDED IN THE RECEIPT ITSELF.
+    A self-signed forgery therefore verifies True — the signature proves
+    the receipt is internally consistent, NOT that it came from a trusted
+    sealer. Real trust = key distribution: only treat a receipt as
+    authoritative if its verify_key_hex matches a key you obtained
+    out-of-band (e.g. this process's SealAuthority.verify_key_hex, or an
+    allow-listed kid). For the lab demo the receipts are MOCK anyway
+    (custody="lab-local-mock"), so this caveat changes nothing today —
+    but any non-mock use MUST check the key against an allow-list first.
+    """
     try:
         vk = VerifyKey(bytes.fromhex(verify_key_hex))
     except (ValueError, TypeError):

@@ -57,7 +57,8 @@ os.makedirs(SAMPLES, exist_ok=True)
 
 def scenario_a_unanimous_cabin() -> dict:
     print("RiderXL demo (a): book the cabin, $240 split 3 ways — unanimous")
-    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"))
+    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"),
+                              permissions=lambda member_id, action: True)  # lab demo: explicit opt-in
     p = svc.propose(
         group_id="cabin-trip-oct",
         description="RiderXL spend proposal: book the cabin, $240 split 3 ways",
@@ -82,7 +83,8 @@ def scenario_a_unanimous_cabin() -> dict:
 
 def scenario_b_veto_kills() -> dict:
     print("RiderXL demo (b): same spend, one member vetoes — unanimous")
-    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"))
+    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"),
+                              permissions=lambda member_id, action: True)  # lab demo: explicit opt-in
     p = svc.propose(
         group_id="cabin-trip-oct",
         description="RiderXL spend proposal: book the cabin, $240 split 3 ways",
@@ -113,7 +115,8 @@ def scenario_b_veto_kills() -> dict:
 
 def scenario_c_majority_with_dissent() -> dict:
     print("RiderXL demo (c): majority policy, 2-of-3 approve, one denies")
-    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"))
+    svc = GroupSpendService(receipts_dir=os.path.join(HERE, "receipts"),
+                              permissions=lambda member_id, action: True)  # lab demo: explicit opt-in
     p = svc.propose(
         group_id="cabin-trip-oct",
         description=("RiderXL spend proposal: book the cabin, $240 split 3 "

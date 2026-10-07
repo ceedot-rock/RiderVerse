@@ -14,6 +14,7 @@ Default is a permissive local stub so the module runs standalone today.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import threading
 import uuid
 
 ACTION_SPEND_APPROVE = "spend:approve"
@@ -137,12 +138,25 @@ class Proposal:
 
 
 class ProposalStore:
-    """In-memory proposal registry with voting and threshold evaluation."""
+    """In-memory proposal registry with voting and threshold evaluation.
 
-    def __init__(self, permissions=None):
+    The permissions callback is REQUIRED — there is no permissive default
+    (review fix 2026-10-07: the old silent stub gave vote-anyone semantics
+    to any caller that forgot to inject the real callback). All mutating
+    paths take an internal lock so concurrent voters cannot double-vote
+    or double-execute.
+    """
+
+    def __init__(self, permissions):
         # permissions(member_id, action) -> bool
-        self._permissions = permissions or _permissive_stub
+        if not callable(permissions):
+            raise ProposalError(
+                "ProposalStore requires a permissions callback "
+                "permissions(member_id, action) -> bool; refusing the "
+                "permissive default")
+        self._permissions = permissions
         self._proposals: dict[str, Proposal] = {}
+        self._lock = threading.Lock()
 
     # -- proposal ----------------------------------------------------------
     def propose(self, group_id: str, description: str, amount_cents: int,
@@ -166,14 +180,16 @@ class ProposalStore:
         p = Proposal(pid, group_id, description, amount_cents,
                      rail.strip().lower(), quote, list(members), policy,
                      proposed_by)
-        self._proposals[pid] = p
+        with self._lock:
+            self._proposals[pid] = p
         return p
 
     def get(self, proposal_id: str) -> Proposal:
-        try:
-            return self._proposals[proposal_id]
-        except KeyError:
-            raise ProposalError("unknown proposal %r" % (proposal_id,))
+        with self._lock:
+            try:
+                return self._proposals[proposal_id]
+            except KeyError:
+                raise ProposalError("unknown proposal %r" % (proposal_id,))
 
     # -- voting ------------------------------------------------------------
     def approve(self, proposal_id: str, member_id: str) -> Proposal:
@@ -184,23 +200,29 @@ class ProposalStore:
 
     def _vote(self, proposal_id: str, member_id: str,
               decision: str) -> Proposal:
-        p = self.get(proposal_id)
-        if p.status != STATUS_OPEN:
-            raise VoteError("proposal %s is %s — voting closed"
-                            % (proposal_id, p.status))
-        if member_id not in p.members:
-            raise VoteError("member %r is not an eligible voter on %s"
-                            % (member_id, proposal_id))
-        if member_id in p.votes:
-            raise VoteError("member %r already voted (%s) on %s"
-                            % (member_id, p.votes[member_id], proposal_id))
-        if not self._permissions(member_id, ACTION_SPEND_APPROVE):
-            raise VoteError("member %r lacks a valid %r grant"
-                            % (member_id, ACTION_SPEND_APPROVE))
+        # Review fix 2026-10-07: the whole check-then-act sequence holds
+        # the store lock — concurrent voters cannot both pass the
+        # already-voted / threshold checks.
+        with self._lock:
+            p = self._proposals.get(proposal_id)
+            if p is None:
+                raise ProposalError("unknown proposal %r" % (proposal_id,))
+            if p.status != STATUS_OPEN:
+                raise VoteError("proposal %s is %s — voting closed"
+                                % (proposal_id, p.status))
+            if member_id not in p.members:
+                raise VoteError("member %r is not an eligible voter on %s"
+                                % (member_id, proposal_id))
+            if member_id in p.votes:
+                raise VoteError("member %r already voted (%s) on %s"
+                                % (member_id, p.votes[member_id], proposal_id))
+            if not self._permissions(member_id, ACTION_SPEND_APPROVE):
+                raise VoteError("member %r lacks a valid %r grant"
+                                % (member_id, ACTION_SPEND_APPROVE))
 
-        p._record_vote(member_id, decision)
-        self._evaluate(p)
-        return p
+            p._record_vote(member_id, decision)
+            self._evaluate(p)
+            return p
 
     def _evaluate(self, p: Proposal) -> None:
         n = len(p.members)

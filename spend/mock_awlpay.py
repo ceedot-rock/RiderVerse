@@ -31,7 +31,15 @@ try:
     calculate_fees = _awl_fees.calculate_fees
     FREE, PRO, L33T = _awl_fees.FREE, _awl_fees.PRO, _awl_fees.L33T
     _FEE_SOURCE = "real:~/workspace/awlpay/server/fees.py"
-except Exception:  # pragma: no cover — fallback only when awlpay is absent
+except (ImportError, ModuleNotFoundError, FileNotFoundError) as _e:
+    # Review fix 2026-10-07: catch ONLY missing-module failures. A broad
+    # `except Exception` here would silently mask a real bug (e.g. a
+    # signature change) in fees.py and drift fee math without a trace.
+    import sys as _sys
+    _sys.stderr.write(
+        "mock_awlpay: real fees.py unavailable (%s) — using hardcoded "
+        "fallback fee formula. Fee math MUST be re-verified against the "
+        "real module before any non-mock use.\n" % _e)
     FREE, PRO, L33T = 0, 1, 2
     FREE_BPS_DIV = 100
     FREE_FLAT_CENTS = 25
