@@ -44,8 +44,8 @@ from chat.agent import (  # noqa: E402
     AGENT_MEMBER_ID, AGENT_NAME, AGENT_SCOPES, RiderXL,
 )
 
-HOST = "127.0.0.1"
-PORT = 8088
+HOST = os.environ.get("RIDERXL_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8088"))
 DATA_DIR = os.path.join(HERE, "data")
 GROUPS_DIR = os.path.join(DATA_DIR, "groups")
 
