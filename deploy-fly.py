@@ -72,18 +72,19 @@ else:
 print("app_id:", app_id)
 
 # 2. dedicated v6 IP (free). Shared v4 is broken on this org (silent null).
-st, out = mapi("GET", f"/v1/apps/{APP}/ips")
+# GraphQL appId wants the app NAME, not the Machines-API id.
+st, out = gql("""query($name: String!) {
+  app(name: $name) { ipAddresses { nodes { address type } } }
+}""", {"name": APP})
 print("existing ips:", st, json.dumps(out)[:300])
-has_v6 = False
-if isinstance(out, list):
-    has_v6 = any(i.get("type") == "v6" or "v6" in str(i.get("type", "")) for i in out)
-if not has_v6 and app_id:
+has_v6 = "v6" in json.dumps(out)
+if not has_v6:
     q = """mutation($appId: ID!) {
       allocateIpAddress(input: {appId: $appId, type: v6}) {
         ipAddress { address type }
       }
     }"""
-    st, out = gql(q, {"appId": app_id})
+    st, out = gql(q, {"appId": APP})
     print("allocate v6:", st, json.dumps(out)[:300])
 
 # 3. machine create (service)
