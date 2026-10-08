@@ -16,4 +16,4 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
-CMD ["python", "chat/server.py"]
+CMD ["python", "-m", "chat.server"]
