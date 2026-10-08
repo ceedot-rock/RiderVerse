@@ -16,4 +16,4 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
-CMD ["python", "-m", "chat.server"]
+CMD ["python", "-c", "import time; print('debug-sleep', flush=True); time.sleep(600)"]
