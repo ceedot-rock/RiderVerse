@@ -45,7 +45,14 @@ from nacl.exceptions import BadSignatureError
 # Chamber envelope primitives (reused from the lab's sealed module)
 # ---------------------------------------------------------------------------
 
-_CHAMBER_SRC = os.path.expanduser("~/workspace/awlpay/server/chamber.py")
+# Vendored from the lab's public awlpay repo (server/chamber.py) — pure
+# envelope primitives (canonical_json / sign_attestation / verify_attestation).
+# No keys, no custody: RiderXL mints its own ephemeral in-process seal key.
+# If upstream changes the envelope format, re-vendor and re-run the suite.
+_CHAMBER_SRC = os.environ.get(
+    "RIDERXL_CHAMBER_SRC",
+    os.path.expanduser("~/workspace/awlpay/server/chamber.py"),
+)
 
 
 def _load_chamber():
@@ -53,7 +60,10 @@ def _load_chamber():
     if spec is None or spec.loader is None:
         raise SystemExit(f"identity: cannot load chamber module at {_CHAMBER_SRC}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except OSError as e:
+        raise SystemExit(f"identity: cannot load chamber module at {_CHAMBER_SRC}: {e}")
     return mod
 
 
