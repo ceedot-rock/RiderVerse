@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RiderXL — group chat demo</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d;
+          --txt:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149;
+          --card:#1c2128; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:10px; padding:10px 14px;
+           background:var(--panel); border-bottom:1px solid var(--line);
+           position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; letter-spacing:.3px; }
+  header h1 .xl { color:var(--acc); }
+  #ident { margin-left:auto; display:flex; align-items:center; gap:8px; font-size:13px; }
+  .badge { padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .badge.trusted { color:var(--ok); border-color:var(--ok); }
+  .badge.untrusted { color:var(--dim); }
+  button { background:#21262d; color:var(--txt); border:1px solid var(--line);
+           border-radius:8px; padding:8px 12px; font-size:14px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.ok { border-color:var(--ok); color:var(--ok); }
+  button:disabled { opacity:.45; cursor:default; }
+  input, select { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+                  border-radius:8px; padding:9px 10px; font-size:14px; }
+  main { max-width:760px; margin:0 auto; padding:14px; }
+  .hidden { display:none !important; }
+  .grouplist .row { display:flex; align-items:center; gap:10px; padding:10px 12px;
+                    background:var(--panel); border:1px solid var(--line);
+                    border-radius:10px; margin-bottom:8px; cursor:pointer; }
+  .grouplist .row:hover { border-color:var(--acc); }
+  .grouplist .row small { color:var(--dim); }
+  .newgroup { display:flex; gap:8px; margin-bottom:14px; }
+  .newgroup input { flex:1; }
+  #joinbox { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:16px; margin-bottom:14px; }
+  #joinbox h2 { margin:0 0 10px; font-size:16px; }
+  #joinbox .frow { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  #joinbox input { flex:1; min-width:160px; }
+  #chat { display:flex; flex-direction:column; height:calc(100dvh - 130px); min-height:320px; }
+  #msgs { flex:1; overflow-y:auto; padding:4px 2px 12px; }
+  .msg { margin:8px 0; max-width:92%; }
+  .msg .who { font-size:12px; color:var(--dim); margin-bottom:2px; }
+  .msg .who.agent { color:var(--acc); font-weight:600; }
+  .msg .bubble { background:var(--panel); border:1px solid var(--line);
+                 border-radius:10px; padding:8px 11px; white-space:pre-wrap;
+                 word-break:break-word; }
+  .msg.me .bubble { border-color:#1f6feb; }
+  .msg.sys .bubble { background:transparent; border-style:dashed; color:var(--dim);
+                     font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--acc); border-radius:12px;
+          padding:12px; margin:10px 0; max-width:94%; }
+  .card h3 { margin:0 0 6px; font-size:15px; }
+  .card p { margin:6px 0; font-size:14px; }
+  .card .scopes { font-family:ui-monospace,monospace; font-size:12.5px;
+                  background:#0d1117; padding:4px 8px; border-radius:6px;
+                  display:inline-block; margin:4px 0; }
+  .card .btns { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .card.approval { border-color:var(--bad); }
+  .card .detail { font-size:13px; color:var(--dim); }
+  .card .statusline { font-size:13px; margin-top:8px; }
+  .card ul { margin:6px 0; padding-left:20px; font-size:14px; }
+  #composer { display:flex; gap:8px; padding:10px 0 4px; }
+  #composer input { flex:1; }
+  .hint { font-size:12.5px; color:var(--dim); margin:8px 0; }
+  kbd { font-family:ui-monospace,monospace; background:#0d1117; border:1px solid var(--line);
+        border-radius:4px; padding:0 5px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rider<span class="xl">XL</span> <small style="color:var(--dim);font-weight:400">lab demo</small></h1>
+  <div id="ident" class="hidden">
+    <span id="identName"></span>
+    <span id="trustBadge" class="badge untrusted">untrusted</span>
+    <button id="btnRevoke" class="danger" title="Cut RiderXL's access to you immediately">Revoke trust</button>
+    <button id="btnSwitch" title="Forget this identity and pick another">Switch</button>
+    <button id="btnLeave" title="Back to group list">Groups</button>
+  </div>
+</header>
+<main>
+  <!-- group list -->
+  <section id="viewGroups" class="grouplist">
+    <div class="newgroup">
+      <input id="newGroupName" placeholder="New group name…" maxlength="80">
+      <button id="btnCreate" class="primary">Create</button>
+    </div>
+    <div id="groupRows"></div>
+    <p class="hint">Open this page in a second tab with <kbd>?as=OtherName</kbd> to chat
+    side-by-side as two different identities.</p>
+  </section>
+
+  <!-- chat -->
+  <section id="viewChat" class="hidden">
+    <div id="joinbox" class="hidden">
+      <h2 id="joinTitle">Join group</h2>
+      <div class="frow">
+        <input id="joinName" placeholder="Display name…" maxlength="40">
+        <select id="joinType">
+          <option value="member">member</option>
+          <option value="guest">non-member guest (name only)</option>
+        </select>
+        <button id="btnJoin" class="primary">Join</button>
+      </div>
+      <p class="hint">Guests have no platform account — they just pick a name and can
+      still read everything RiderXL posts. Nobody can use RiderXL until they
+      grant it permission.</p>
+    </div>
+    <div id="chat" class="hidden">
+      <div id="msgs"></div>
+      <form id="composer">
+        <input id="input" placeholder="Message… (try @agent help)" autocomplete="off" maxlength="2000">
+        <button class="primary" type="submit">Send</button>
+      </form>
+      <p class="hint">Commands: <kbd>@agent help</kbd> · <kbd>@agent plan the trip</kbd> ·
+      <kbd>@agent split the bill</kbd> · <kbd>@agent book the flights</kbd> (asks approval first)</p>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const API = "";
+let identity = JSON.parse(localStorage.getItem("rxl_identity") || "null");
+let groupId = null, memberId = null, since = 0, pollTimer = null, trusted = false;
+const seenSeq = new Set();
+
+const qsAs = new URLSearchParams(location.search).get("as");
+if (qsAs && !identity) { /* prefill only; user still taps Join */ }
+
+/* ---------- identity ---------- */
+function saveIdentity() { localStorage.setItem("rxl_identity", JSON.stringify(identity)); }
+
+/* ---------- caller auth: Ed25519 proof-of-ownership ----------
+   The browser holds its own Ed25519 keypair (WebCrypto), generated once
+   and persisted as JWK. The pubkey is sent at join (first-bind-wins,
+   server-side); every trust-mutating request is signed over
+   METHOD\nPATH\nBODY\nTIMESTAMP and verified server-side. */
+const te = new TextEncoder();
+const hexB = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2,"0")).join("");
+const b64B = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+let _keys = null;
+async function getKeys() {
+  if (_keys) return _keys;
+  const stored = JSON.parse(localStorage.getItem("rxl_keypair") || "null");
+  if (stored && stored.pub && stored.priv) {
+    try {
+      const raw = Uint8Array.from(stored.pub.match(/../g).map(h => parseInt(h, 16)));
+      const publicKey = await crypto.subtle.importKey("raw", raw, {name:"Ed25519"}, true, ["verify"]);
+      const privateKey = await crypto.subtle.importKey("jwk", stored.priv, {name:"Ed25519"}, true, ["sign"]);
+      _keys = {publicKey, privateKey, pubkeyHex: stored.pub};
+      return _keys;
+    } catch (e) { /* corrupted entry — regenerate below */ }
+  }
+  const kp = await crypto.subtle.generateKey({name:"Ed25519"}, true, ["sign","verify"]);
+  const pubkeyHex = hexB(await crypto.subtle.exportKey("raw", kp.publicKey));
+  const privJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+  localStorage.setItem("rxl_keypair", JSON.stringify({pub: pubkeyHex, priv: privJwk}));
+  _keys = {publicKey: kp.publicKey, privateKey: kp.privateKey, pubkeyHex};
+  return _keys;
+}
+async function signedFetch(path, body) {
+  const keys = await getKeys();
+  const bodyStr = JSON.stringify(body);
+  const ts = Math.floor(Date.now()/1000).toString();
+  const sig = await crypto.subtle.sign({name:"Ed25519"}, keys.privateKey,
+    te.encode("POST\n" + path + "\n" + bodyStr + "\n" + ts));
+  const r = await fetch(API + path, {method:"POST",
+    headers:{"Content-Type":"application/json",
+             "X-Identity-Id": identity.identity_id,
+             "X-Identity-Ts": ts,
+             "X-Identity-Sig": b64B(sig)},
+    body: bodyStr});
+  return r;
+}
+function renderIdentity() {
+  if (!identity) { $("ident").classList.add("hidden"); return; }
+  $("ident").classList.remove("hidden");
+  $("identName").textContent = identity.display_name;
+  const b = $("trustBadge");
+  b.textContent = trusted ? "trusted ✓" : "untrusted";
+  b.className = "badge " + (trusted ? "trusted" : "untrusted");
+}
+async function refreshTrust() {
+  if (!identity) { trusted = false; renderIdentity(); return; }
+  const q = groupId ? `?group_id=${groupId}` : "";
+  const r = await fetch(`${API}/api/trust/${identity.identity_id}${q}`);
+  trusted = (await r.json()).trusted;
+  renderIdentity();
+}
+$("btnSwitch").onclick = () => {
+  localStorage.removeItem("rxl_identity"); identity = null;
+  memberId = null; stopPoll(); showGroups();
+};
+$("btnLeave").onclick = () => { memberId = null; stopPoll(); showGroups(); };
+$("btnRevoke").onclick = async () => {
+  if (!identity || !groupId) return;
+  await signedFetch(`/api/groups/${groupId}/revoke`,
+    {identity_id: identity.identity_id});
+  await refreshTrust();
+};
+
+/* ---------- groups ---------- */
+async function showGroups() {
+  groupId = null;
+  $("viewChat").classList.add("hidden"); $("viewGroups").classList.remove("hidden");
+  const r = await fetch(`${API}/api/groups`);
+  const {groups} = await r.json();
+  $("groupRows").innerHTML = groups.length ? "" :
+    '<p class="hint">No groups yet — create one above.</p>';
+  for (const g of groups) {
+    const d = document.createElement("div");
+    d.className = "row";
+    d.innerHTML = `<b></b> <small></small>`;
+    d.querySelector("b").textContent = g.name;
+    d.querySelector("small").textContent =
+      `${g.member_count} member${g.member_count==1?"":"s"} · ${g.group_id}`;
+    d.onclick = () => enterGroup(g.group_id);
+    $("groupRows").appendChild(d);
+  }
+}
+$("btnCreate").onclick = async () => {
+  const name = $("newGroupName").value.trim();
+  const r = await fetch(`${API}/api/groups`, {method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify({name})});
+  const g = await r.json();
+  $("newGroupName").value = "";
+  enterGroup(g.group_id);
+};
+
+/* ---------- entering / joining ---------- */
+async function enterGroup(gid) {
+  groupId = gid; since = 0; seenSeq.clear(); $("msgs").innerHTML = "";
+  $("viewGroups").classList.add("hidden"); $("viewChat").classList.remove("hidden");
+  $("joinbox").classList.remove("hidden"); $("chat").classList.add("hidden");
+  if (qsAs) $("joinName").value = qsAs;
+  else if (identity) $("joinName").value = identity.display_name;
+  const r = await fetch(`${API}/api/groups/${gid}`);
+  $("joinTitle").textContent = "Join “" + (await r.json()).name + "”";
+  // try silent rejoin if we already have an identity seated here.
+  // The join POST is idempotent: it returns the existing seat and
+  // (re-)binds our Ed25519 pubkey, so signed requests keep working.
+  if (identity) {
+    const st = await (await fetch(`${API}/api/groups/${gid}`)).json();
+    const me = st.members.find(m => m.identity_id === identity.identity_id);
+    if (me) {
+      try {
+        const keys = await getKeys();
+        const r = await fetch(`${API}/api/groups/${gid}/join`, {method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({display_name: identity.display_name,
+            member_type: "member", identity_id: identity.identity_id,
+            identity_pubkey: keys.pubkeyHex})});
+        const j = await r.json();
+        if (!j.error) { memberId = j.member_id; return startChat(); }
+      } catch (e) { /* fall through to the manual join box */ }
+    }
+  }
+  startPollPreview();
+}
+$("btnJoin").onclick = async () => {
+  const display_name = $("joinName").value.trim();
+  if (!display_name) return;
+  if (!identity || identity.display_name !== display_name) {
+    identity = {identity_id: "id-" + Math.random().toString(36).slice(2,10),
+                display_name};
+    saveIdentity();
+  }
+  let keys;
+  try { keys = await getKeys(); }
+  catch (e) { alert("Caller auth unavailable: this browser cannot do Ed25519 via WebCrypto (" + e.message + ")"); return; }
+  const r = await fetch(`${API}/api/groups/${groupId}/join`, {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({display_name,
+      member_type: $("joinType").value, identity_id: identity.identity_id,
+      identity_pubkey: keys.pubkeyHex})});
+  const j = await r.json();
+  if (j.error) {
+    // key conflict (stale stored identity): rotate to a fresh identity id
+    if (r.status === 403) { identity = null; localStorage.removeItem("rxl_identity"); }
+    alert(j.error); return;
+  }
+  identity.identity_id = j.identity_id; saveIdentity();
+  memberId = j.member_id;
+  await refreshTrust();
+  startChat();
+};
+function startChat() {
+  $("joinbox").classList.add("hidden"); $("chat").classList.remove("hidden");
+  startPoll();
+}
+
+/* ---------- polling & rendering ---------- */
+function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+function startPollPreview() { stopPoll(); pollTimer = setInterval(() => poll(true), 1500); poll(true); }
+function startPoll() { stopPoll(); pollTimer = setInterval(() => poll(false), 1500); poll(false); }
+
+async function poll(preview) {
+  if (!groupId) return;
+  const r = await fetch(`${API}/api/groups/${groupId}/poll?since=${since}`);
+  if (!r.ok) return;
+  const st = await r.json();
+  since = st.seq;
+  for (const m of st.messages) {
+    if (seenSeq.has(m.seq)) continue;
+    seenSeq.add(m.seq);
+    if (!preview || m.kind !== "text" || m.member_id === "agent")
+      renderMsg(m, st);
+  }
+  if (!preview) { /* keep trust badge fresh */ }
+}
+function esc(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+
+function renderMsg(m, st) {
+  const wrap = $("msgs");
+  if (m.kind === "permission_request") return renderPermCard(m, wrap);
+  if (m.kind === "approval_card") return renderApprovalCard(m, st, wrap);
+  if (m.kind === "task_card") return renderTaskCard(m, st, wrap);
+  const d = document.createElement("div");
+  const isAgent = m.member_id === "agent";
+  d.className = "msg" + (m.kind === "system" ? " sys" : "") +
+                (identity && m.member_id === memberId ? " me" : "");
+  d.innerHTML = `<div class="who${isAgent?" agent":""}"></div><div class="bubble"></div>`;
+  d.querySelector(".who").textContent = isAgent ? "RiderXL" : m.display_name;
+  d.querySelector(".bubble").innerHTML = esc(m.text);
+  wrap.appendChild(d);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderPermCard(m, wrap) {
+  const p = m.payload || {};
+  const mine = identity && p.identity_id === identity.identity_id;
+  const pending = true; // server only keeps one pending card per identity
+  const d = document.createElement("div");
+  d.className = "card";
+  d.innerHTML = `<h3>🔐 Permission request</h3>
+    <p><b>RiderXL</b> wants to link with <b></b>:</p>
+    <div><span class="scopes"></span></div>
+    <p class="detail">RiderXL does nothing for you until you grant this.
+    Deny and it stays silent. Revoke anytime with “Revoke trust”.</p>
+    <div class="btns"></div>`;
+  d.querySelectorAll("b")[1].textContent = p.display_name || "";
+  d.querySelector(".scopes").textContent = (p.scopes || []).join(", ");
+  const btns = d.querySelector(".btns");
+  if (mine) {
+    const g = document.createElement("button"); g.className = "ok"; g.textContent = "Grant";
+    const x = document.createElement("button"); x.className = "danger"; x.textContent = "Deny";
+    g.onclick = async () => {
+      await signedFetch(`/api/groups/${groupId}/grant`,
+        {identity_id: identity.identity_id});
+      btns.innerHTML = '<span class="statusline">Granted ✓</span>';
+      await refreshTrust();
+    };
+    x.onclick = async () => {
+      await signedFetch(`/api/groups/${groupId}/deny`,
+        {identity_id: identity.identity_id});
+      btns.innerHTML = '<span class="statusline">Denied.</span>';
+      await refreshTrust();
+    };
+    btns.append(g, x);
+  } else {
+    btns.innerHTML = `<span class="detail">Waiting on ${esc(p.display_name || "them")}…</span>`;
+  }
+  wrap.appendChild(d);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderApprovalCard(m, st, wrap) {
+  const t = (st.tasks || {})[m.payload.task_id] || {};
+  const p = t.payload || {};
+  const d = document.createElement("div");
+  d.className = "card approval";
+  d.innerHTML = `<h3>✋ Approval needed</h3>
+    <p></p><p class="detail"></p><p class="detail"></p><div class="btns"></div>`;
+  d.querySelectorAll("p")[0].textContent = "“" + (p.request || m.text) + "”";
+  d.querySelectorAll("p")[1].textContent = "Requested by " + (p.requested_by || "?") + ".";
+  d.querySelectorAll("p")[2].textContent =
+    "RiderXL will NOT act until a member approves. (Anti-Instinct rule.)";
+  const btns = d.querySelector(".btns");
+  const status = t.status || "pending_approval";
+  if (status === "pending_approval" && identity && memberId) {
+    const ok = document.createElement("button"); ok.className = "ok"; ok.textContent = "Approve";
+    const no = document.createElement("button"); no.className = "danger"; no.textContent = "Deny";
+    const decide = async (which) => {
+      const r = await signedFetch(`/api/groups/${groupId}/tasks/${m.payload.task_id}/${which}`,
+        {member_id: memberId});
+      const j = await r.json();
+      btns.innerHTML = `<span class="statusline">${esc(j.status || j.error || which)}</span>`;
+    };
+    ok.onclick = () => decide("approve");
+    no.onclick = () => decide("deny");
+    btns.append(ok, no);
+  } else {
+    btns.innerHTML = `<span class="statusline">Status: ${esc(status)}</span>`;
+  }
+  wrap.appendChild(d);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderTaskCard(m, st, wrap) {
+  const t = (st.tasks || {})[m.payload.task_id] || {};
+  const p = t.payload || {};
+  const d = document.createElement("div");
+  d.className = "card";
+  let body = `<h3>📋 ${esc(t.title || "Task")}</h3><p></p>`;
+  d.innerHTML = body;
+  d.querySelector("p").textContent = m.text;
+  if (p.items) {
+    const ul = document.createElement("ul");
+    for (const it of p.items) { const li = document.createElement("li"); li.textContent = it; ul.appendChild(li); }
+    d.appendChild(ul);
+  }
+  if (p.entries && Object.keys(p.entries).length) {
+    const ul = document.createElement("ul");
+    for (const [k, v] of Object.entries(p.entries)) {
+      const li = document.createElement("li"); li.textContent = `${k}: $${Number(v).toFixed(2)}`;
+      ul.appendChild(li);
+    }
+    d.appendChild(ul);
+  }
+  wrap.appendChild(d);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+/* ---------- composer ---------- */
+$("composer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("input").value.trim();
+  if (!text || !memberId) return;
+  $("input").value = "";
+  await signedFetch(`/api/groups/${groupId}/messages`, {member_id: memberId, text});
+  poll(false);
+});
+
+showGroups();
+refreshTrust();
+</script>
+</body>
+</html>

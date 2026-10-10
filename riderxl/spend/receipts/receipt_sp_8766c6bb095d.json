@@ -1,0 +1,83 @@
+{
+  "label": "RiderXL MOCK RECEIPT \u2014 sealed with a runtime lab key (custody=lab-local-mock). No real money moved, no chain broadcast, no production attestation.",
+  "mock_tx_id": "mock-tx-2a5b3219b0b3440b",
+  "mode": "MOCK",
+  "network": "none",
+  "product": "RiderXL",
+  "proposal": {
+    "amount_cents": 24000,
+    "approvals": [
+      "alice",
+      "bob",
+      "corey"
+    ],
+    "created_at": "2026-10-05T22:47:58.365206+00:00",
+    "denials": [],
+    "description": "RiderXL spend proposal: book the cabin, $240 split 3 ways",
+    "executed": true,
+    "group_id": "cabin-trip-oct",
+    "members": [
+      "corey",
+      "alice",
+      "bob"
+    ],
+    "policy": "unanimous",
+    "proposal_id": "sp_8766c6bb095d",
+    "proposed_by": "corey",
+    "quote": {
+      "amount_cents": 24000,
+      "amount_usd": "240.00",
+      "fee_cents": 265,
+      "fee_source": "real:~/workspace/awlpay/server/fees.py",
+      "fee_status": "free",
+      "label": "RiderXL MOCK QUOTE \u2014 no real money, no chain interaction",
+      "mode": "MOCK",
+      "net_cents": 23735,
+      "network": "none",
+      "product": "RiderXL",
+      "rail": "tron-usdt",
+      "tier": "free"
+    },
+    "rail": "tron-usdt",
+    "status": "APPROVED",
+    "status_reason": "unanimous approval (3/3)",
+    "votes": {
+      "alice": "approve",
+      "bob": "approve",
+      "corey": "approve"
+    }
+  },
+  "quote": {
+    "amount_cents": 24000,
+    "amount_usd": "240.00",
+    "fee_cents": 265,
+    "fee_source": "real:~/workspace/awlpay/server/fees.py",
+    "fee_status": "free",
+    "label": "RiderXL MOCK QUOTE \u2014 no real money, no chain interaction",
+    "mode": "MOCK",
+    "net_cents": 23735,
+    "network": "none",
+    "product": "RiderXL",
+    "rail": "tron-usdt",
+    "tier": "free"
+  },
+  "seal": {
+    "alg": "ed25519",
+    "custody": "lab-local-mock",
+    "kid": "5b5df5fcb6868e0d",
+    "payload": "{\"amount_cents\":24000,\"approvals\":[\"alice\",\"bob\",\"corey\"],\"denials\":[],\"description\":\"RiderXL spend proposal: book the cabin, $240 split 3 ways\",\"executed_at\":\"2026-10-05T22:47:58.365291+00:00\",\"fee_cents\":265,\"group_id\":\"cabin-trip-oct\",\"label\":\"RiderXL MOCK SEALED RECEIPT \\u2014 no real money moved\",\"mock_tx_id\":\"mock-tx-2a5b3219b0b3440b\",\"mode\":\"MOCK\",\"net_cents\":23735,\"network\":\"none\",\"policy\":\"unanimous\",\"product\":\"RiderXL\",\"proposal_id\":\"sp_8766c6bb095d\",\"rail\":\"tron-usdt\",\"status_reason\":\"unanimous approval (3/3)\",\"tier\":\"free\"}",
+    "sig": "bf649ac360baeae10867d8611492f6a5705746ba85424aea533702178b3b56aeaebf0c6a670fa2fec3e052a7c8974632cf6e57f608f84142161c9f7449f4a80f",
+    "verify_key_hex": "adbaae7918db44e183dd3b4dbcd67877e5ba2bd1282a661e22ac1bf8c864cf7a"
+  },
+  "seal_custody": "lab-local-mock",
+  "seal_kid": "5b5df5fcb6868e0d",
+  "seal_verify_key_hex": "adbaae7918db44e183dd3b4dbcd67877e5ba2bd1282a661e22ac1bf8c864cf7a",
+  "votes": {
+    "approve": [
+      "alice",
+      "bob",
+      "corey"
+    ],
+    "deny": []
+  }
+}
