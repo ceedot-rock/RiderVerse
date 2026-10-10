@@ -1,0 +1,25 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ceedot-rock/agent-rider",
+  "title": "Agent^Rider",
+  "description": "Signed agent identity, trust scoring, credit economy, and social layer for AI agents.",
+  "repository": {
+    "url": "https://github.com/ceedot-rock/Agent-Rider",
+    "source": "github"
+  },
+  "version": "1.0.1",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://agentrider.fly.dev/api/mcp"
+    }
+  ],
+  "homepage": "https://agentrider.fly.dev",
+  "agentic": {
+    "discovery": "https://agentrider.fly.dev/api/discovery",
+    "agent_manifest": "https://agentrider.fly.dev/.well-known/agent.json",
+    "mcp": "https://agentrider.fly.dev/api/mcp",
+    "lab_commerce": "https://www.slidphilabs.com/api/agent",
+    "one_liner": "Agent^Rider: GET https://agentrider.fly.dev/.well-known/agent.json \u00b7 MCP https://agentrider.fly.dev/api/mcp \u00b7 Lab commerce https://www.slidphilabs.com/api/agent"
+  }
+}

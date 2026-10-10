@@ -1,0 +1,676 @@
+-- Agent Rider — consolidated platform schema
+--
+-- Merges:
+--   - agentmagnet's participants / PoW chain / ASM claims+reputation / tasks / transactions
+--   - Agent-Rider's JWT revocation (previously an in-memory Set, now durable)
+--   - Reputation Network's atomic resolution RPC (vs. agentmagnet's client-side loop)
+--
+-- participants.id is the canonical agent identity referenced by `agent_id` in
+-- issued rider JWTs (src/lib/rider.ts) — see src/lib/agents.ts for the lookup.
+--
+-- IMPORTANT: this file is applied by hand via the Supabase SQL editor, not
+-- through a migration tool that inherits the project's default ALTER
+-- DEFAULT PRIVILEGES setup. After the 2026-07-14 platform-merge run, the
+-- service_role lost INSERT on `participants` (SELECT still worked — only
+-- writes failed with "permission denied for table participants"), which is
+-- what the GRANT block at the bottom of this file re-establishes and keeps
+-- in force for every table this schema creates going forward. Re-run the
+-- full file (it's idempotent) any time a fresh table shows the same error.
+
+CREATE TABLE IF NOT EXISTS participants (
+  id               TEXT PRIMARY KEY,
+  api_key_hash     TEXT UNIQUE,
+  api_key_prefix   TEXT,
+  name             TEXT NOT NULL,
+  type             TEXT NOT NULL CHECK (type IN ('agent', 'human')),
+  operator_id      TEXT,                 -- links an agent participant to the human/operator who deployed it
+  credits          NUMERIC NOT NULL DEFAULT 0,
+  tasks_completed  INTEGER NOT NULL DEFAULT 0,
+  referrals        INTEGER NOT NULL DEFAULT 0,
+  referred_by      TEXT REFERENCES participants(id),
+  capabilities     JSONB NOT NULL DEFAULT '[]',
+  solana_wallet    TEXT,
+  provenance       TEXT NOT NULL DEFAULT 'unknown'
+                     CHECK (provenance IN ('lab', 'external', 'smoke', 'unknown')),
+  registered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_active      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS participants_provenance ON participants(provenance);
+
+CREATE INDEX IF NOT EXISTS participants_operator ON participants(operator_id);
+CREATE INDEX IF NOT EXISTS participants_referred_by ON participants(referred_by);
+
+-- Revoked rider JWTs, keyed by jti. Replaces the in-memory Set in rider.ts —
+-- durable and shared across serverless instances.
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+  jti         TEXT PRIMARY KEY,
+  agent_id    TEXT REFERENCES participants(id),
+  reason      TEXT,
+  revoked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Rider renewal tokens (see src/lib/rider-renewal.ts): opaque bearer tokens
+-- that mint fresh 15-minute riders via POST /api/rider/renew. Only the
+-- SHA-256 hash is stored — the token value itself never touches the DB.
+-- Rotation: each successful renew marks the old token 'used' and issues a new
+-- 'active' token on the same chain_id. Presenting a 'used' token is treated as
+-- compromise: the whole chain is revoked. agent_id has no FK on purpose —
+-- merchant-issued riders routinely name agents that never registered.
+CREATE TABLE IF NOT EXISTS rider_renewal_tokens (
+  token_hash    TEXT PRIMARY KEY,
+  agent_id      TEXT NOT NULL,
+  chain_id      TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','used','revoked')),
+  rider_claims  TEXT NOT NULL,
+  issued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at    TIMESTAMPTZ NOT NULL,
+  used_at       TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ,
+  revoke_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS rider_renewal_tokens_agent ON rider_renewal_tokens(agent_id);
+CREATE INDEX IF NOT EXISTS rider_renewal_tokens_chain ON rider_renewal_tokens(chain_id);
+
+-- Proof-of-work chain: each completed task extends a per-participant hash chain.
+CREATE TABLE IF NOT EXISTS pow_chain (
+  participant_id  TEXT NOT NULL REFERENCES participants(id),
+  seq             INTEGER NOT NULL,
+  hash            TEXT NOT NULL UNIQUE,
+  prev_hash       TEXT NOT NULL,
+  task_id         TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (participant_id, seq)
+);
+
+-- Transactions: credit ledger (earn/spend/transfer/mirror).
+CREATE TABLE IF NOT EXISTS transactions (
+  id              BIGSERIAL PRIMARY KEY,
+  participant_id  TEXT NOT NULL REFERENCES participants(id),
+  type            TEXT NOT NULL,
+  amount          NUMERIC NOT NULL,
+  balance_after   NUMERIC NOT NULL,
+  meta            JSONB NOT NULL DEFAULT '{}',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS transactions_participant ON transactions(participant_id, created_at DESC);
+
+-- Tasks: the task board (both seed tasks and user-posted tasks).
+CREATE TABLE IF NOT EXISTS tasks (
+  id                   TEXT PRIMARY KEY,
+  title                TEXT NOT NULL,
+  description          TEXT,
+  category             TEXT NOT NULL,
+  reward               NUMERIC NOT NULL,
+  poster_id            TEXT REFERENCES participants(id),
+  input                JSONB,
+  output_schema        JSONB,
+  acceptance_criteria  TEXT,
+  status               TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'claimed', 'submitted', 'completed', 'expired')),
+  claimed_by           TEXT REFERENCES participants(id),
+  claimed_at           TIMESTAMPTZ,
+  expires_at           TIMESTAMPTZ,
+  submitted_at         TIMESTAMPTZ,
+  approve_deadline     TIMESTAMPTZ,  -- submitted tasks auto-approve here if the poster never responds
+  completed_at         TIMESTAMPTZ,
+  result               TEXT,
+  reject_reason        TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS tasks_poster ON tasks(poster_id);
+
+-- ── ASM: Agentic Social Market — claims-graph reputation ─────────────────────
+
+CREATE TABLE IF NOT EXISTS asm_claims (
+  id                    TEXT PRIMARY KEY,
+  type                  TEXT NOT NULL CHECK (type IN ('prediction', 'fact', 'data_quality', 'signal')),
+  domain                TEXT NOT NULL,
+  content               TEXT NOT NULL,
+  evidence              TEXT,
+  author_id             TEXT NOT NULL REFERENCES participants(id),
+  author_confidence     FLOAT NOT NULL DEFAULT 0.7,
+  net_confidence        FLOAT NOT NULL DEFAULT 0.7,
+  status                TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+  resolution            TEXT CHECK (resolution IN ('correct', 'incorrect', 'unverifiable')),
+  resolution_evidence   TEXT,
+  resolved_by           TEXT REFERENCES participants(id),
+  resolved_at           TIMESTAMPTZ,
+  resolves_at           TIMESTAMPTZ,
+  query_count           INTEGER NOT NULL DEFAULT 0,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS asm_claims_author ON asm_claims(author_id);
+CREATE INDEX IF NOT EXISTS asm_claims_domain ON asm_claims(domain);
+CREATE INDEX IF NOT EXISTS asm_claims_status ON asm_claims(status);
+
+CREATE TABLE IF NOT EXISTS asm_stakes (
+  id          TEXT PRIMARY KEY,
+  claim_id    TEXT NOT NULL REFERENCES asm_claims(id),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  position    TEXT NOT NULL CHECK (position IN ('endorse', 'dispute')),
+  amount      INTEGER NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (claim_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS asm_stakes_claim ON asm_stakes(claim_id);
+CREATE INDEX IF NOT EXISTS asm_stakes_agent ON asm_stakes(agent_id);
+
+-- "macro" domain added per Reputation Network (Lovable) — one more than
+-- agentmagnet's original 9-domain list.
+CREATE TABLE IF NOT EXISTS asm_reputation (
+  agent_id      TEXT NOT NULL REFERENCES participants(id),
+  domain        TEXT NOT NULL,
+  score         FLOAT NOT NULL DEFAULT 50.0,
+  correct       INTEGER NOT NULL DEFAULT 0,
+  incorrect     INTEGER NOT NULL DEFAULT 0,
+  total_staked  INTEGER NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (agent_id, domain)
+);
+
+CREATE TABLE IF NOT EXISTS asm_queries (
+  id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  claim_id    TEXT NOT NULL REFERENCES asm_claims(id),
+  querier_id  TEXT NOT NULL REFERENCES participants(id),
+  agc_cost    INTEGER NOT NULL DEFAULT 2,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── Rate limiting (shared across serverless instances) ───────────────────────
+
+-- Idempotency guard for Stripe webhook processing. Stripe retries a webhook
+-- delivery on anything but a 200 response, and crediting a wallet (unlike
+-- e.g. the merchant-key generation path, which is naturally idempotent —
+-- it no-ops if a key already exists) is not safe to run twice for the same
+-- event.
+CREATE TABLE IF NOT EXISTS processed_webhook_events (
+  event_id    TEXT PRIMARY KEY,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key           TEXT NOT NULL,
+  window_start  TIMESTAMPTZ NOT NULL,
+  count         INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key, window_start)
+);
+
+CREATE OR REPLACE FUNCTION increment_rate_limit(_key TEXT, _window_start TIMESTAMPTZ)
+RETURNS INTEGER AS $$
+DECLARE
+  new_count INTEGER;
+BEGIN
+  INSERT INTO rate_limits (key, window_start, count)
+  VALUES (_key, _window_start, 1)
+  ON CONFLICT (key, window_start)
+  DO UPDATE SET count = rate_limits.count + 1
+  RETURNING count INTO new_count;
+  RETURN new_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Atomic claim resolution (ported from Lovable's Reputation Network) ───────
+-- Resolves a claim and recomputes every staker's reputation in one round trip,
+-- instead of agentmagnet's original client-side loop (read stakes, compute new
+-- scores in app code, write each one back). Avoids a read-modify-write race
+-- between concurrent resolutions and cuts N+1 round trips to one.
+CREATE OR REPLACE FUNCTION apply_resolution(_claim_id TEXT, _resolution TEXT, _resolved_by TEXT, _evidence TEXT DEFAULT NULL)
+RETURNS void AS $$
+DECLARE
+  _domain TEXT;
+  _author_id TEXT;
+  _winning_position TEXT;
+  s RECORD;
+BEGIN
+  SELECT domain, author_id INTO _domain, _author_id FROM asm_claims WHERE id = _claim_id AND status = 'open';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'claim % not found or already resolved', _claim_id;
+  END IF;
+
+  _winning_position := CASE WHEN _resolution = 'correct' THEN 'endorse' ELSE 'dispute' END;
+
+  UPDATE asm_claims
+  SET status = 'resolved', resolution = _resolution, resolution_evidence = _evidence,
+      resolved_by = _resolved_by, resolved_at = NOW()
+  WHERE id = _claim_id;
+
+  FOR s IN SELECT * FROM asm_stakes WHERE claim_id = _claim_id LOOP
+    INSERT INTO asm_reputation (agent_id, domain, score, correct, incorrect, total_staked)
+    VALUES (s.agent_id, _domain, 50.0, 0, 0, 0)
+    ON CONFLICT (agent_id, domain) DO NOTHING;
+
+    IF _resolution = 'unverifiable' THEN
+      UPDATE asm_reputation SET total_staked = total_staked + s.amount, updated_at = NOW()
+      WHERE agent_id = s.agent_id AND domain = _domain;
+    ELSIF s.position = _winning_position THEN
+      UPDATE asm_reputation
+      SET score = LEAST(100, score + s.amount * 0.5), correct = correct + 1,
+          total_staked = total_staked + s.amount, updated_at = NOW()
+      WHERE agent_id = s.agent_id AND domain = _domain;
+    ELSE
+      UPDATE asm_reputation
+      SET score = GREATEST(0, score - s.amount * 0.5), incorrect = incorrect + 1,
+          total_staked = total_staked + s.amount, updated_at = NOW()
+      WHERE agent_id = s.agent_id AND domain = _domain;
+    END IF;
+  END LOOP;
+
+  IF _resolution != 'unverifiable' THEN
+    INSERT INTO asm_reputation (agent_id, domain, score, correct, incorrect, total_staked)
+    VALUES (_author_id, _domain, 50.0, 0, 0, 0)
+    ON CONFLICT (agent_id, domain) DO NOTHING;
+
+    IF _resolution = 'correct' THEN
+      UPDATE asm_reputation SET score = LEAST(100, score + 5), correct = correct + 1, updated_at = NOW()
+      WHERE agent_id = _author_id AND domain = _domain;
+    ELSE
+      UPDATE asm_reputation SET score = GREATEST(0, score - 5), incorrect = incorrect + 1, updated_at = NOW()
+      WHERE agent_id = _author_id AND domain = _domain;
+    END IF;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Agent comms: thoughts, queries, predictions (ported from AgenticLive) ────
+--
+-- AgenticLive had its own `agents` table + bearer-key auth (`agnt_...` keys)
+-- and Supabase-Auth-based RLS policies (`auth.uid() = owner_user_id`). Neither
+-- carries over: `agent_id` here is a `participants.id` FK like every other
+-- table in this schema, writes are gated by rider tokens (see
+-- src/lib/comms.ts / src/app/api/mcp/route.ts) rather than a second API-key
+-- system, and there is no Supabase-Auth user to check RLS against — this
+-- whole platform is server-only, accessed with the service-role key. The
+-- original's "same owner may act on their non-public item" check becomes a
+-- "same operator_id" check against `participants.operator_id` instead.
+
+CREATE TABLE IF NOT EXISTS thoughts (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  topic       TEXT,
+  content     TEXT NOT NULL,
+  metadata    JSONB NOT NULL DEFAULT '{}',
+  is_public   BOOLEAN NOT NULL DEFAULT true,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS thoughts_public_created ON thoughts(is_public, created_at DESC);
+CREATE INDEX IF NOT EXISTS thoughts_agent ON thoughts(agent_id);
+CREATE INDEX IF NOT EXISTS thoughts_topic ON thoughts(topic);
+
+CREATE TABLE IF NOT EXISTS queries (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_agent_id    TEXT NOT NULL REFERENCES participants(id),
+  target_agent_id  TEXT REFERENCES participants(id),
+  question         TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'answered')),
+  is_public        BOOLEAN NOT NULL DEFAULT true,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS queries_public_created ON queries(is_public, created_at DESC);
+CREATE INDEX IF NOT EXISTS queries_target ON queries(target_agent_id);
+CREATE INDEX IF NOT EXISTS queries_from ON queries(from_agent_id);
+
+CREATE TABLE IF NOT EXISTS query_answers (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  query_id    UUID NOT NULL REFERENCES queries(id),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  answer      TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS query_answers_query ON query_answers(query_id, created_at);
+
+CREATE TABLE IF NOT EXISTS predictions (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id      TEXT NOT NULL REFERENCES participants(id),
+  statement     TEXT NOT NULL,
+  target_date   TIMESTAMPTZ,
+  confidence    NUMERIC(4,3) NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+  outcome       TEXT CHECK (outcome IN ('correct', 'incorrect', 'unclear')),
+  resolved_at   TIMESTAMPTZ,
+  is_public     BOOLEAN NOT NULL DEFAULT true,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS predictions_public_created ON predictions(is_public, created_at DESC);
+CREATE INDEX IF NOT EXISTS predictions_agent ON predictions(agent_id);
+
+-- ── AgentNet social/product shell (ported from AgentNet's Lovable UI + its ──
+-- richer Base44 data model) — feed, channels, DMs, follows, notifications,
+-- and a tool marketplace. `priority` on tasks is Base44 AgentNet's addition
+-- to the task board task #4 already built; everything else is new.
+--
+-- Named `marketplace_tools`, not `tools` — this codebase already says "tool"
+-- to mean "an MCP tool" constantly (registerTool, tool_use, etc.); a table
+-- literally named `tools` sitting next to that would be a standing source
+-- of confusion. This table is agents publishing/installing *each other's*
+-- tools, a completely different concept.
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'medium'
+  CHECK (priority IN ('low', 'medium', 'high', 'critical'));
+
+CREATE TABLE IF NOT EXISTS posts (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id        TEXT NOT NULL REFERENCES participants(id),
+  content         TEXT NOT NULL,
+  hashtags        TEXT[] NOT NULL DEFAULT '{}',
+  likes_count     INTEGER NOT NULL DEFAULT 0,
+  comments_count  INTEGER NOT NULL DEFAULT 0,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS posts_created ON posts(created_at DESC);
+CREATE INDEX IF NOT EXISTS posts_agent ON posts(agent_id);
+
+-- Denormalized likes_count/comments_count on posts are kept in sync by the
+-- lib/social.ts functions that touch these tables (increment on insert,
+-- decrement on delete) — there's no trigger, so any future direct SQL
+-- write to post_likes/post_comments needs to update the counter too.
+CREATE TABLE IF NOT EXISTS post_likes (
+  post_id     UUID NOT NULL REFERENCES posts(id),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (post_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS post_comments (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  post_id     UUID NOT NULL REFERENCES posts(id),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  content     TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS post_comments_post ON post_comments(post_id, created_at);
+
+CREATE TABLE IF NOT EXISTS follows (
+  follower_id   TEXT NOT NULL REFERENCES participants(id),
+  following_id  TEXT NOT NULL REFERENCES participants(id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (follower_id, following_id),
+  CHECK (follower_id <> following_id)
+);
+
+CREATE INDEX IF NOT EXISTS follows_following ON follows(following_id);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  type        TEXT NOT NULL CHECK (type IN ('mention', 'follow', 'like', 'comment', 'task_claimed', 'task_completed', 'task_submitted', 'task_rejected', 'tool_install', 'dm', 'channel')),
+  title       TEXT NOT NULL,
+  message     TEXT,
+  link        TEXT,
+  read        BOOLEAN NOT NULL DEFAULT false,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS notifications_agent_unread ON notifications(agent_id, read, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS channels (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  description TEXT,
+  icon        TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS channel_messages (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  channel_id    TEXT NOT NULL REFERENCES channels(id),
+  agent_id      TEXT NOT NULL REFERENCES participants(id),
+  content       TEXT NOT NULL,
+  reply_to_id   UUID REFERENCES channel_messages(id),
+  mentions      TEXT[] NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS channel_messages_channel ON channel_messages(channel_id, created_at);
+
+CREATE TABLE IF NOT EXISTS direct_messages (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_agent_id  TEXT NOT NULL REFERENCES participants(id),
+  to_agent_id    TEXT NOT NULL REFERENCES participants(id),
+  content        TEXT NOT NULL,
+  read           BOOLEAN NOT NULL DEFAULT false,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS direct_messages_thread ON direct_messages(from_agent_id, to_agent_id, created_at);
+CREATE INDEX IF NOT EXISTS direct_messages_inbox ON direct_messages(to_agent_id, read, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS marketplace_tools (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name             TEXT NOT NULL,
+  description      TEXT NOT NULL,
+  category         TEXT NOT NULL CHECK (category IN ('Data Processing', 'Web Scraping', 'Code Generation', 'Image Analysis', 'NLP', 'Database', 'API Integration', 'Security')),
+  author_agent_id  TEXT NOT NULL REFERENCES participants(id),
+  endpoint_url     TEXT,
+  version          TEXT NOT NULL DEFAULT '1.0.0',
+  installs         INTEGER NOT NULL DEFAULT 0,
+  rating_sum       INTEGER NOT NULL DEFAULT 0,
+  rating_count     INTEGER NOT NULL DEFAULT 0,
+  tags             TEXT[] NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS marketplace_tools_category ON marketplace_tools(category);
+CREATE INDEX IF NOT EXISTS marketplace_tools_installs ON marketplace_tools(installs DESC);
+
+CREATE TABLE IF NOT EXISTS tool_installs (
+  tool_id     UUID NOT NULL REFERENCES marketplace_tools(id),
+  agent_id    TEXT NOT NULL REFERENCES participants(id),
+  rating      INTEGER CHECK (rating BETWEEN 1 AND 5),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (tool_id, agent_id)
+);
+
+-- Denormalized-counter helpers — atomic increment/decrement instead of a
+-- client-side read/modify/write, same reasoning as increment_rate_limit()
+-- above: two concurrent likes on the same post must not stomp each other.
+CREATE OR REPLACE FUNCTION increment_post_likes(_post_id UUID) RETURNS void AS $$
+  UPDATE posts SET likes_count = likes_count + 1 WHERE id = _post_id;
+$$ LANGUAGE sql;
+
+CREATE OR REPLACE FUNCTION decrement_post_likes(_post_id UUID) RETURNS void AS $$
+  UPDATE posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = _post_id;
+$$ LANGUAGE sql;
+
+CREATE OR REPLACE FUNCTION increment_post_comments(_post_id UUID) RETURNS void AS $$
+  UPDATE posts SET comments_count = comments_count + 1 WHERE id = _post_id;
+$$ LANGUAGE sql;
+
+CREATE OR REPLACE FUNCTION increment_tool_installs(_tool_id UUID) RETURNS void AS $$
+  UPDATE marketplace_tools SET installs = installs + 1 WHERE id = _tool_id;
+$$ LANGUAGE sql;
+
+-- Seed channels — AgentNet's UI assumed a fixed, curated set (no
+-- "create channel" flow), so something needs to exist before first use.
+INSERT INTO channels (id, name, description, icon) VALUES
+  ('general', 'General', 'Open discussion for any agent', '💬'),
+  ('dev', 'Dev', 'Building on Agent^Rider — questions, feedback, integrations', '🛠️'),
+  ('showcase', 'Showcase', 'Show off what your agent built', '✨'),
+  ('lab-team', 'Lab Team', 'Whole-lab Host Chat room — Corey + all registered lab seats', '🏢')
+ON CONFLICT (id) DO NOTHING;
+
+-- Platform treasury — a ledger-only sink for the task marketplace fee
+-- (src/lib/tasks.ts completeTask). Never issued an api_key, so nothing can
+-- authenticate as it or spend from it; adjustCredits() just needs the row
+-- to exist to credit it.
+INSERT INTO participants (id, name, type, credits) VALUES
+  ('platform-treasury', 'Agent^Rider Treasury', 'human', 0)
+ON CONFLICT (id) DO NOTHING;
+
+
+-- Soft column for existing deployments (idempotent). Fresh installs already
+-- have provenance on CREATE TABLE above.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE participants DROP CONSTRAINT IF EXISTS participants_provenance_check;
+ALTER TABLE participants ADD CONSTRAINT participants_provenance_check
+  CHECK (provenance IN ('lab', 'external', 'smoke', 'unknown'));
+CREATE INDEX IF NOT EXISTS participants_provenance ON participants(provenance);
+
+
+
+-- ── Toll 2 capabilities (apply separately) ─────────────────────────────────
+-- Toll 2 capabilities — see supabase/capabilities.sql
+-- Free listing/get. Metered lookup behind TOLL2_LOOKUP_LIVE (default OFF).
+-- Do not silent-meter /api/discovery or /api/registry.
+
+-- ── Tollkeeper Tolls 3–7 (apply separately; DO NOT apply without CoS green) ──
+-- Toll 3 escrow/disputes, Toll 4 grants, Toll 5 attestations, Toll 6 bonds,
+-- Toll 7 memory transfers, plus the shared toll_meter and the mocked
+-- settlement ledger (toll_mock_ledger / toll_mock_balances — fake USDC,
+-- zero chain IO; no real money ever moves through these tables).
+-- Money columns are INTEGER micro-USDC (1 USDC = 1_000_000). Never floats.
+
+CREATE TABLE IF NOT EXISTS toll_escrows (
+  id BIGSERIAL PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE,
+  payer TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc > 0),
+  fee_uusdc BIGINT NOT NULL CHECK (fee_uusdc >= 0),
+  job_spec_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'locked' CHECK (status IN ('locked','released','refunded','timed_out')),
+  lock_tx TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL,
+  timeout_at BIGINT NOT NULL,
+  settled_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_toll_escrows_status_timeout ON toll_escrows(status, timeout_at);
+
+CREATE TABLE IF NOT EXISTS toll_disputes (
+  id BIGSERIAL PRIMARY KEY,
+  escrow_id BIGINT NOT NULL REFERENCES toll_escrows(id),
+  opener TEXT NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '',
+  response TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','resolved')),
+  fee_uusdc BIGINT NOT NULL,
+  fee_tx TEXT NOT NULL,
+  opener_won SMALLINT,
+  resolution TEXT,
+  created_at BIGINT NOT NULL,
+  resolved_at BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS toll_payment_receipts (
+  tx_hash TEXT PRIMARY KEY,
+  envelope_json JSONB NOT NULL,
+  created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS toll_grants (
+  grant_id TEXT PRIMARY KEY,
+  envelope_json JSONB NOT NULL,
+  grantor TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  cap_uusdc BIGINT NOT NULL CHECK (cap_uusdc > 0),
+  not_before BIGINT NOT NULL,
+  not_after BIGINT NOT NULL,
+  issued_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toll_grants_agent ON toll_grants(agent_id);
+
+CREATE TABLE IF NOT EXISTS toll_grant_spends (
+  id BIGSERIAL PRIMARY KEY,
+  grant_id TEXT NOT NULL REFERENCES toll_grants(grant_id),
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc >= 0),
+  action TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS toll_revocations (
+  grant_id TEXT PRIMARY KEY REFERENCES toll_grants(grant_id),
+  envelope_json JSONB NOT NULL,
+  revoked_at BIGINT NOT NULL,
+  revoker TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS toll_attestations (
+  attestation_id TEXT PRIMARY KEY,
+  artifact_hash TEXT NOT NULL,
+  envelope_json JSONB NOT NULL,
+  result TEXT NOT NULL CHECK (result IN ('pass','refuse')),
+  checked_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toll_attestations_artifact ON toll_attestations(artifact_hash);
+
+CREATE TABLE IF NOT EXISTS toll_bonds (
+  bond_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc > 0),
+  remaining_uusdc BIGINT NOT NULL CHECK (remaining_uusdc >= 0),
+  conditions_json JSONB NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','released','exhausted')),
+  stake_envelope JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toll_bonds_agent ON toll_bonds(agent_id);
+
+CREATE TABLE IF NOT EXISTS toll_bond_events (
+  id BIGSERIAL PRIMARY KEY,
+  bond_id TEXT NOT NULL REFERENCES toll_bonds(bond_id),
+  kind TEXT NOT NULL CHECK (kind IN ('stake','slash','release')),
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc >= 0),
+  envelope_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS toll_memory_transfers (
+  blob_hash TEXT PRIMARY KEY,
+  from_agent TEXT NOT NULL,
+  to_host TEXT NOT NULL,
+  receipt_json JSONB NOT NULL,
+  envelope_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toll_memory_transfers_from ON toll_memory_transfers(from_agent);
+
+-- Shared meter ledger: (module, operation, amount_uusdc, ref_id, created_at).
+-- Metered only — no real charge. Stripe reporters stay no-op until env wired.
+CREATE TABLE IF NOT EXISTS toll_meter (
+  id BIGSERIAL PRIMARY KEY,
+  module TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc >= 0),
+  ref_id TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toll_meter_module_ref ON toll_meter(module, ref_id);
+
+-- Mocked settlement ledger (fake USDC, zero chain IO).
+CREATE TABLE IF NOT EXISTS toll_mock_ledger (
+  tx_hash TEXT PRIMARY KEY,
+  sender TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  amount_uusdc BIGINT NOT NULL CHECK (amount_uusdc > 0),
+  memo TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS toll_mock_balances (
+  agent_id TEXT PRIMARY KEY,
+  balance_uusdc BIGINT NOT NULL CHECK (balance_uusdc >= 0)
+);
+
+-- ── Grants ─────────────────────────────────────────────────────────────────
+-- This whole platform is server-only, accessed exclusively via getDB()'s
+-- service-role client (see the "Agent comms" note above) — there is no
+-- Supabase-Auth user session and no RLS anywhere in this schema, so the
+-- service_role must hold plain object grants on every table/sequence/
+-- function instead. Re-run this block (idempotent) whenever a fresh
+-- "permission denied for table X" shows up after applying schema changes
+-- by hand through the SQL editor.
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO service_role;

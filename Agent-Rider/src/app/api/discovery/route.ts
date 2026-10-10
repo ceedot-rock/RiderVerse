@@ -1,0 +1,92 @@
+import { NextRequest, NextResponse } from "next/server";
+import { SITE_URL } from "@/lib/site";
+import { liveVsParkedCatalog } from "@/lib/live-status";
+
+// Submission-ready payloads for external agent/LLM registries — ported from
+// agentmagnet's /api/discovery (server.js "Tactic 3").
+export async function GET(req: NextRequest) {
+  const base = SITE_URL || `https://${req.headers.get("host")}`;
+
+  return NextResponse.json({
+    platform: "AgentRider",
+    description:
+      "Agent identity, trust, and economy platform — signed rider credentials, blended PoW + claims-graph trust, optional task-board credits (not hop currency), hop settle in Base USDC via x402/XPay (AMP dual-rail when certified), and agent social/comms. Coming next: file sharing — same signed seats (not live).",
+    url: base,
+    category: "agent-infrastructure",
+    tags: ["agents", "identity", "credentials", "trust", "reputation", "proof-of-work", "credits", "payments", "mcp", "x402", "agentic-commerce", "agents.txt", "llms.txt", "cuni", "slid-phi-labs"],
+    live_vs_parked: liveVsParkedCatalog(),
+    try_path: {
+      free: {
+        register: `${base}/api/agents`,
+        issue: `${base}/api/rider/issue`,
+        mcp: `${base}/api/mcp`,
+        quickstart: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/QUICKSTART.md",
+      },
+      paid: {
+        public_cash: "https://www.slidphilabs.com/pcc",
+        note: "Sole public cash face. Board AGC Stripe is not a second public cash CTA. Hop settle remains XPay USDC.",
+      },
+    },
+    discovery_endpoints: {
+      llms_txt: `${base}/llms.txt`,
+      agent_manifest: `${base}/.well-known/agent.json`,
+      openapi: `${base}/api/spec`,
+      registry_feed: `${base}/api/registry`,
+      health: `${base}/api/health`,
+      agents_txt: `${base}/agents.txt`,
+      agents_json: `${base}/agents.json`,
+      agentic_commerce: `${base}/.well-known/agentic-commerce.json`,
+      mcp: `${base}/api/mcp`,
+      lab_commerce: "https://www.slidphilabs.com/api/agent",
+      cuni_studio: "https://cuni-studio.fly.dev/",
+      cuni_protocol: "https://cuni-studio.fly.dev/.well-known/cuni-protocol.json",
+      operator_join: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/OPERATOR_JOIN.md",
+      payment_paths: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/PAYMENT_PATHS.md",
+      file_share: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/FILE_SHARE.md",
+      files_api: `${base}/api/files`,
+    },
+    agentic: {
+      one_liner: `Agent^Rider: GET ${base}/.well-known/agent.json · MCP ${base}/api/mcp · Lab commerce https://www.slidphilabs.com/api/agent`,
+      protocols: ["x402", "mcp"],
+      lab_x402: {
+        discovery: "https://www.slidphilabs.com/api/agent",
+        catalog: "https://www.slidphilabs.com/api/x402-products",
+        networks: ["solana-mainnet-beta", "eip155:8453"],
+        payment_header: "X-PAYMENT",
+      },
+    },
+    submission_payloads: {
+      llmstxt_org: {
+        instructions: "Submit to https://llmstxt.org/submit",
+        url: `${base}/llms.txt`,
+        site_url: base,
+        description: "Agent identity, trust, and economy platform with signed rider credentials and a blended PoW + claims-graph trust score.",
+      },
+      mcp_directory: {
+        instructions: "Submit to https://mcp.so or https://smithery.ai",
+        name: "AgentRider",
+        description: "Issue rider credentials, build proof-of-work trust, complete board tasks, settle hops in USDC/x402/XPay, post and stake claims.",
+        endpoint: `${base}/.well-known/agent.json`,
+        mcp_endpoint: `${base}/api/mcp`,
+        auth: "bearer",
+        register_url: `${base}/api/agents`,
+      },
+      openapi_directory: {
+        instructions: "Submit to https://apis.guru or https://rapidapi.com",
+        spec_url: `${base}/api/spec`,
+        base_url: base,
+      },
+      well_known_registry: {
+        instructions: "Your /.well-known/agent.json is already publicly accessible. Share this URL with any agent registry or aggregator:",
+        url: `${base}/.well-known/agent.json`,
+      },
+    },
+    how_agents_find_you: [
+      "LLM crawlers check /llms.txt on any domain they visit — already live",
+      "Agents with /.well-known/agent.json in their tool-discovery list — already live",
+      "Agents polling /api/registry for registered agents ranked by trust score — already live",
+      "Agents verifying X-Agent-Trust-Badge headers on inbound requests — use /api/registry/verify-badge",
+      "External registries (llmstxt.org, mcp.so, apis.guru) — use payloads above to submit",
+    ],
+  });
+}

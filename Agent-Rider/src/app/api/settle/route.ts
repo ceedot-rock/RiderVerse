@@ -1,0 +1,137 @@
+import { NextRequest, NextResponse } from "next/server";
+import { checkGate, isGateOk } from "@/lib/rider";
+import { isSandboxRider, sandboxForbiddenBody } from "@/lib/sandbox";
+import { checkCitizenReceiptGate, isCitizenGateOk } from "@/lib/cuni-citizen-gate";
+import {
+  assertAttestationForSensitiveOp,
+  readAttestationEvidence,
+} from "@/lib/attestation-evidence";
+import { verifySealedRideForExecute } from "@/lib/sealed-ride-envelope";
+import { parseCuniSettle, parseKeyRail, settleX402, type SettleHop } from "@/lib/settle-hop";
+
+export async function POST(req: NextRequest) {
+  const gate = await checkGate(req, "L1");
+  if (!isGateOk(gate)) {
+    return NextResponse.json(gate.body, { status: gate.status, headers: gate.headers });
+  }
+
+  // Sandbox riders may probe settle (402 accepts) but never complete a funded X-PAYMENT hop.
+  if (isSandboxRider(gate.rider) && req.headers.get("x-payment")) {
+    return NextResponse.json(sandboxForbiddenBody({ rail: "x402" }), { status: 403 });
+  }
+
+  // Host attestation fail-closed when ATTESTATION_REQUIRED=1 (default off — unchanged).
+  {
+    const evidence = readAttestationEvidence({
+      headerJson: req.headers.get("x-attestation-evidence"),
+    });
+    const att = assertAttestationForSensitiveOp(evidence);
+    if (att.ok === false) {
+      return NextResponse.json(att.body, { status: att.status });
+    }
+  }
+
+  const ctype = req.headers.get("content-type") || "";
+  let hop: SettleHop | null = null;
+  let jsonBody: Record<string, unknown> = {};
+  if (ctype.includes("text/plain") || ctype.includes("application/cuni")) {
+    hop = parseCuniSettle(await req.text());
+  } else {
+    jsonBody = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (typeof jsonBody.cuni === "string") hop = parseCuniSettle(jsonBody.cuni);
+    else if (jsonBody.hop_id && jsonBody.key_id) hop = jsonBody as unknown as SettleHop;
+  }
+
+  const citizenGate = checkCitizenReceiptGate(jsonBody);
+  if (!isCitizenGateOk(citizenGate)) {
+    return NextResponse.json(citizenGate.body, { status: citizenGate.status });
+  }
+
+  // Sealed ride: off-by-default; when SEALED_RIDE_REQUIRED=1 refuse unbound/invalid.
+  {
+    const sealed = verifySealedRideForExecute(
+      (jsonBody as Record<string, unknown>).sealed_ride ??
+        (jsonBody as Record<string, unknown>).sealedRide
+    );
+    if (sealed.ok === false) {
+      return NextResponse.json(sealed.body, { status: sealed.status });
+    }
+  }
+
+  if (!hop) {
+    return NextResponse.json(
+      {
+        error: "SettleHop required",
+        hint: "JSON body needs hop_id, job_id, key_id, amount_usd, meter. For hop debit use key_id=x402:<resource> and X-PAYMENT after 402 accepts.",
+        docs_url: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/SETTLE_SMOKE.md",
+        example: {
+          hop_id: "hop-1",
+          job_id: "job-1",
+          key_id: "x402:job-1",
+          amount_usd: 0.01,
+          meter: { egress_gb: 0, compute_s: 0, codec_s: 0 },
+        },
+      },
+      { status: 400 }
+    );
+  }
+
+  const { rail, rest } = parseKeyRail(hop.key_id);
+
+  if (rail === "credits") {
+    return NextResponse.json(
+      {
+        error: "reject.agc_removed",
+        rail: "credits",
+        message: "Board credits / AGC are not a hop currency. Use key_id=x402:<resource> and X-PAYMENT (USDC on Base via XPay default).",
+        hint: "Credits stay on the board. Funded hop settle: mint rider → 402 accepts → EIP-3009 pay → POST with X-PAYMENT.",
+        docs_url: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/SETTLE_SMOKE.md",
+      },
+      { status: 410 }
+    );
+  }
+
+  if (rail === "stripe") {
+    return NextResponse.json(
+      {
+        error: "reject.human_attach",
+        rail: "stripe",
+        message: "Stripe attaches a wallet/key. It does not debit a hop. After checkout, settle with x402:",
+        checkout: "/api/checkout",
+        price_hint: rest || "price_1TsQAOK8JsmXFzvIKmUsVDoK",
+      },
+      { status: 402 }
+    );
+  }
+
+  if (rail === "tiun") {
+    return NextResponse.json(
+      {
+        error: "reject.human_attach",
+        rail: "tiun",
+        message: "tiun is entitlement. Not a per-hop debit. After the human pays, settle with x402:",
+        product: rest || null,
+      },
+      { status: 402 }
+    );
+  }
+
+  const resource = rail === "x402" ? rest || hop.job_id : hop.job_id;
+  const out = await settleX402({
+    resource,
+    paymentHeader: req.headers.get("x-payment"),
+    amountUsd: hop.amount_usd,
+  });
+  return NextResponse.json(
+    {
+      hop_id: hop.hop_id,
+      job_id: hop.job_id,
+      key_id: hop.key_id,
+      ...(citizenGate.receipt
+        ? { citizen_receipt_source_hash: citizenGate.receipt.source_hash }
+        : {}),
+      ...out.body,
+    },
+    { status: out.status }
+  );
+}

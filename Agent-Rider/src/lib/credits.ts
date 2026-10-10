@@ -1,0 +1,157 @@
+import { getDB } from "@/lib/db";
+import { resolveById, adjustCredits, recordTransaction } from "@/lib/agents";
+import { verifyWarrant, type Warrant } from "@/lib/narrow";
+
+// AGC credit economy — ported from agentmagnet/routes/tokens.js.
+export const SERVICE_COSTS: Record<string, number> = {
+  search: 2,
+  analyze: 3,
+  generate: 5,
+  export: 8,
+  priority: 10,
+  hop: 1,
+};
+
+export const CREDITS_PER_USD = Number(process.env.CREDITS_PER_USD ?? 100);
+export const MIN_PURCHASE_USD_CENTS = 100;
+export const MAX_PURCHASE_USD_CENTS = 50000;
+
+export function usdCentsToCredits(usdCents: number): number {
+  return Math.round((usdCents / 100) * CREDITS_PER_USD);
+}
+
+export interface TransferResult {
+  yourBalance: number;
+  recipientBalance: number;
+}
+
+export async function transferCredits(fromId: string, toId: string, amount: number): Promise<TransferResult> {
+  if (amount <= 0) throw new Error("amount must be positive");
+
+  const [sender, recipient] = await Promise.all([resolveById(fromId), resolveById(toId)]);
+  if (!sender) throw new Error("sender_not_found");
+  if (!recipient) throw new Error("recipient_not_found");
+  if (sender.credits < amount) throw new Error("insufficient_credits");
+
+  const yourBalance = await adjustCredits(fromId, -amount, "transfer_out", { toId, toName: recipient.name });
+  const recipientBalance = await adjustCredits(toId, amount, "transfer_in", { fromId, fromName: sender.name });
+
+  return { yourBalance, recipientBalance };
+}
+
+export interface SpendResult {
+  creditsSpent: number;
+  creditsRemaining: number;
+  service: string;
+  units: number;
+  generated?: string;
+}
+
+const GROK_MODEL = process.env.GROK_MODEL || "grok-4.6";
+
+export async function spendCredits(
+  participantId: string,
+  service: string,
+  units = 1,
+  prompt?: string,
+  warrant?: Warrant | null
+): Promise<SpendResult> {
+  const costPerUnit = SERVICE_COSTS[service];
+  if (!costPerUnit) throw new Error("unknown_service");
+
+  const participant = await resolveById(participantId);
+  if (!participant) throw new Error("participant_not_found");
+
+  const cost = costPerUnit * units;
+  if (warrant) {
+    const gate = verifyWarrant(warrant);
+    if (gate.ok === false) throw new Error(gate.error);
+    if (gate.body.agent_id !== participantId) throw new Error("warrant_agent");
+    if (cost > gate.body.max_cents) throw new Error("warrant_cap");
+  }
+  // Promo comp: 3 free months of Rider access — toll charges are waived while
+  // comped_until is in the future. Usage is still ledgered (amount 0).
+  const { isComped } = await import("@/lib/promo");
+  const comped = isComped(participant.compedUntil);
+  if (!comped && participant.credits < cost) throw new Error("insufficient_credits");
+
+  async function recordCompedUse(): Promise<number> {
+    await recordTransaction(participantId, "spend_comped", 0, { service, units }).catch(() => {});
+    return participant.credits;
+  }
+
+  if (service === "generate") {
+    if (!prompt) throw new Error("prompt_required");
+    const apiKey = process.env.XAI_API_KEY;
+    if (!apiKey) throw new Error("missing_xai_api_key");
+
+    let generated: string;
+    try {
+      const res = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: GROK_MODEL,
+          max_tokens: 1024,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(typeof body.error === "string" ? body.error : body.error?.message || res.statusText);
+      }
+      generated = body.choices?.[0]?.message?.content ?? "";
+    } catch (err) {
+      throw new Error(`generation_failed: ${(err as Error).message}`);
+    }
+
+    const remaining = comped
+      ? await recordCompedUse()
+      : await adjustCredits(participantId, -cost, "spend", {
+          service,
+          units,
+          prompt: prompt.slice(0, 100),
+        });
+    return {
+      creditsSpent: comped ? 0 : cost,
+      creditsRemaining: remaining,
+      service,
+      units,
+      generated,
+    };
+  }
+
+  const remaining = comped
+    ? await recordCompedUse()
+    : await adjustCredits(participantId, -cost, "spend", { service, units });
+  return { creditsSpent: comped ? 0 : cost, creditsRemaining: remaining, service, units };
+}
+
+export async function getTransactionHistory(participantId: string, limit = 20) {
+  const db = getDB();
+  const { data } = await db
+    .from("transactions")
+    .select("*")
+    .eq("participant_id", participantId)
+    .order("created_at", { ascending: false })
+    .limit(Math.min(limit, 100));
+  return data ?? [];
+}
+
+export async function mirrorCreditToOperator(agentId: string, amount: number): Promise<void> {
+  const agent = await resolveById(agentId);
+  if (!agent || agent.type !== "agent" || !agent.referredBy) return;
+
+  const human = await resolveById(agent.referredBy);
+  if (!human || human.type !== "human") return;
+
+  const mirror = Math.floor(amount * 0.25);
+  if (mirror <= 0) return;
+
+  await adjustCredits(human.id, mirror, "mirror", { fromAgent: agentId, agentName: agent.name });
+}
+
+export { recordTransaction };

@@ -1,0 +1,248 @@
+import { NextRequest, NextResponse } from "next/server";
+import { issueRider, riderAuthErrorBody, type ClearanceLevel, type RiderPayload } from "@/lib/rider";
+import { tryMintRenewalToken } from "@/lib/rider-renewal";
+import { findSubscriptionByMerchantKey } from "@/lib/stripe";
+import { resolveById, resolveByApiKey } from "@/lib/agents";
+import { getBlendedTrustScore } from "@/lib/reputation";
+import { checkRiderIssueLimit, getClientIp } from "@/lib/rate-limit";
+import {
+  isSandboxApiKey,
+  sandboxIssuePayload,
+  sandboxKeyConfigured,
+  wantsSandboxHeader,
+} from "@/lib/sandbox";
+import {
+  assertAttestationForSensitiveOp,
+  readAttestationEvidence,
+} from "@/lib/attestation-evidence";
+
+const ACTIVE_STATUSES = new Set(["active", "trialing"]);
+const VALID_LEVELS = new Set<ClearanceLevel>(["L0", "L1", "L2", "L3", "L4"]);
+const SELF_SERVICE_MAX_LEVEL: ClearanceLevel = "L1";
+const LEVEL_RANK: Record<ClearanceLevel, number> = { L0: 0, L1: 1, L2: 2, L3: 3, L4: 4 };
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Merchant-Key, X-Platform-Key, Authorization, X-Rider-Sandbox",
+};
+
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS_HEADERS });
+}
+
+function extractBearer(req: NextRequest): string | null {
+  const header = req.headers.get("authorization");
+  if (!header) return null;
+  const [scheme, token] = header.split(" ");
+  if (scheme?.toLowerCase() !== "bearer" || !token) return null;
+  return token.trim();
+}
+
+function rateLimited(retryAfter: number) {
+  return NextResponse.json(
+    {
+      error: "rate_limit_exceeded",
+      retry_after: retryAfter,
+      hint: "too many rider issues; wait and retry (default 30/hour per principal)",
+    },
+    {
+      status: 429,
+      headers: { ...CORS_HEADERS, "retry-after": String(retryAfter) },
+    }
+  );
+}
+
+// Two ways to mint a rider, previously only one existed:
+//
+// 1. Merchant-gated (original): a paying merchant (X-Merchant-Key, active
+//    Stripe subscription) mints a token for *any* agent_id at *any* level —
+//    the original Merchant Gate "verification as a service" product.
+// 2. Self-service (new): a registered participant mints a token for
+//    *themselves*, proven by their own api_key from POST /api/agents.
+//    Capped at L1 regardless of what's requested — higher clearance stays
+//    merchant- or platform-granted, not self-assigned. Without this path,
+//    a freshly registered agent had no way to obtain a rider_token at all,
+//    which every write tool on the platform (tasks, credits, claims,
+//    comms — everything from the agentmagnet/AgentNet/AgenticLive ports)
+//    requires. Merchant Gate was designed for a different product shape
+//    (merchants verifying agents before serving them) and never had a path
+//    for agents to act as first-class participants on their own.
+export async function POST(req: NextRequest) {
+  const merchantKey = req.headers.get("x-merchant-key");
+  const apiKey = extractBearer(req);
+  // Platform key: first-party trust (e.g. slidphilabs.com backend after its own
+  // Stripe checkout). Set RIDER_PLATFORM_KEY on the host; callers send it as
+  // X-Platform-Key. Mints like a merchant — any agent_id, any level — without
+  // requiring a Stripe subscription on this host.
+  const platformKey = req.headers.get("x-platform-key");
+  const platformKeyOk = !!(
+    platformKey &&
+    process.env.RIDER_PLATFORM_KEY &&
+    platformKey === process.env.RIDER_PLATFORM_KEY
+  );
+
+  if (!merchantKey && !apiKey && !platformKeyOk) {
+    return NextResponse.json(
+      riderAuthErrorBody("missing_auth", {
+        hint: "send X-Merchant-Key (paid merchant, any agent/level) or Authorization: Bearer <your api_key> (self-service, capped at L1)",
+      }),
+      { status: 401, headers: CORS_HEADERS }
+    );
+  }
+
+  const body = await req.json().catch(() => ({}));
+
+  // Host attestation fail-closed when ATTESTATION_REQUIRED=1 (default off — unchanged).
+  {
+    const evidence = readAttestationEvidence({
+      headerJson: req.headers.get("x-attestation-evidence"),
+      body,
+    });
+    const att = assertAttestationForSensitiveOp(evidence);
+    if (att.ok === false) {
+      return NextResponse.json(att.body, { status: att.status, headers: CORS_HEADERS });
+    }
+  }
+
+  const requestedLevel: ClearanceLevel = VALID_LEVELS.has(body.level) ? body.level : "L1";
+  const scopes: string[] = Array.isArray(body.scopes) && body.scopes.length > 0 ? body.scopes : ["*"];
+
+  // Free sandbox mint — dry identity only (no spend / no funded settle).
+  if (apiKey && isSandboxApiKey(apiKey)) {
+    const ip = getClientIp(req);
+    const rl = await checkRiderIssueLimit(`sandbox:${ip}`);
+    if (!rl.ok) return rateLimited(rl.retryAfter);
+    const sandboxClaims = sandboxIssuePayload();
+    const { token, jti, expires_in } = await issueRider(sandboxClaims);
+    const renewal = await tryMintRenewalToken(sandboxClaims.agent_id, sandboxClaims);
+    return NextResponse.json(
+      {
+        rider: token,
+        jti,
+        expires_in,
+        renewal_token: renewal?.renewal_token ?? null,
+        renewal_expires_in: renewal?.renewal_expires_in ?? null,
+        header_to_send: "X-Agent-Rider",
+        mode: "sandbox",
+        cash_face: "https://www.slidphilabs.com/pcc",
+        hint: "Sandbox rider is dry-only. Funded settle needs a real ar_ key. Cash face is PCC, not Rider.",
+        sandbox_header: wantsSandboxHeader(req) ? "1" : undefined,
+      },
+      { headers: CORS_HEADERS }
+    );
+  }
+
+  if (apiKey && wantsSandboxHeader(req) && !sandboxKeyConfigured()) {
+    return NextResponse.json(
+      {
+        error: "sandbox_not_configured",
+        hint: "Server RIDER_SANDBOX_API_KEY is unset. Use ephemeral register (POST /api/agents) for free dry path, or ask ops to set the sandbox key.",
+        docs_url: "https://github.com/ceedot-rock/Agent-Rider/blob/main/docs/QUICKSTART.md",
+        cash_face: "https://www.slidphilabs.com/pcc",
+      },
+      { status: 503, headers: CORS_HEADERS }
+    );
+  }
+
+  if (merchantKey || platformKeyOk) {
+    const ip = getClientIp(req);
+    const rl = await checkRiderIssueLimit(`merchant:${ip}`);
+    if (!rl.ok) return rateLimited(rl.retryAfter);
+
+    // Platform key (first-party, e.g. slidphilabs.com after its own Stripe
+    // checkout) mints like a merchant without a Stripe subscription lookup.
+    if (!platformKeyOk) {
+      try {
+        const subscription = await findSubscriptionByMerchantKey(merchantKey!);
+        if (!subscription || !ACTIVE_STATUSES.has(subscription.status)) {
+          return NextResponse.json(
+            { error: "invalid_or_inactive_merchant_key" },
+            { status: 402, headers: CORS_HEADERS }
+          );
+        }
+      } catch (err: any) {
+        console.error("rider issue: merchant key check failed", err);
+        return NextResponse.json(
+          { error: "merchant_key_check_failed" },
+          { status: 500, headers: CORS_HEADERS }
+        );
+      }
+    }
+
+    const agent_id: string = body.agent_id ?? `agent-${crypto.randomUUID().slice(0, 8)}`;
+    const operator_id: string = body.operator_id ?? "unknown-operator";
+
+    // Look up the real computed trust score for registered agents instead of
+    // trusting a caller-supplied value. Unregistered agent_ids (common here —
+    // merchants can mint for agent_ids that never registered with us) simply
+    // carry no reputation_score.
+    const participant = await resolveById(agent_id).catch(() => null);
+    const reputation_score = participant ? await getBlendedTrustScore(agent_id) : undefined;
+
+    const merchantClaims: Omit<RiderPayload, "jti"> = {
+      agent_id,
+      operator_id,
+      level: requestedLevel,
+      scopes,
+      reputation_score,
+      layer_from: "agent",
+      layer_to: "human",
+    };
+    const { token, jti, expires_in } = await issueRider(merchantClaims);
+    const renewal = await tryMintRenewalToken(agent_id, merchantClaims);
+
+    return NextResponse.json(
+      {
+        rider: token,
+        jti,
+        expires_in,
+        renewal_token: renewal?.renewal_token ?? null,
+        renewal_expires_in: renewal?.renewal_expires_in ?? null,
+        header_to_send: "X-Agent-Rider",
+      },
+      { headers: CORS_HEADERS }
+    );
+  }
+
+  const participant = await resolveByApiKey(apiKey!);
+  if (!participant) {
+    return NextResponse.json(
+      riderAuthErrorBody("invalid_api_key", {
+        hint: "Bearer must be your registered API key; see docs_url for join path",
+      }),
+      { status: 401, headers: CORS_HEADERS }
+    );
+  }
+
+  const rl = await checkRiderIssueLimit(`agent:${participant.id}`);
+  if (!rl.ok) return rateLimited(rl.retryAfter);
+
+  const level: ClearanceLevel =
+    LEVEL_RANK[requestedLevel] < LEVEL_RANK[SELF_SERVICE_MAX_LEVEL] ? requestedLevel : SELF_SERVICE_MAX_LEVEL;
+  const reputation_score = await getBlendedTrustScore(participant.id);
+
+  const selfClaims: Omit<RiderPayload, "jti"> = {
+    agent_id: participant.id,
+    operator_id: participant.operatorId ?? "self",
+    level,
+    scopes,
+    reputation_score,
+    layer_from: participant.type,
+    layer_to: "human",
+  };
+  const { token, jti, expires_in } = await issueRider(selfClaims);
+  const renewal = await tryMintRenewalToken(participant.id, selfClaims);
+
+  return NextResponse.json(
+    {
+      rider: token,
+      jti,
+      expires_in,
+      renewal_token: renewal?.renewal_token ?? null,
+      renewal_expires_in: renewal?.renewal_expires_in ?? null,
+      header_to_send: "X-Agent-Rider",
+    },
+    { headers: CORS_HEADERS }
+  );
+}

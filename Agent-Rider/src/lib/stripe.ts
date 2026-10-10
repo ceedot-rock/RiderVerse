@@ -1,0 +1,237 @@
+import Stripe from "stripe";
+
+function getStripe(): Stripe {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  if (!secretKey) {
+    throw new Error(
+      "Missing STRIPE_SECRET_KEY environment variable. Set it in Vercel project settings (Production/Preview) or your local .env file."
+    );
+  }
+  return new Stripe(secretKey, {
+    apiVersion: "2026-06-24.dahlia",
+    typescript: true,
+  });
+}
+
+export const stripe = new Proxy({} as Stripe, {
+  get(_t, prop, recv) {
+    const s = getStripe() as unknown as Record<PropertyKey, unknown>;
+    const v = s[prop];
+    return typeof v === "function" ? v.bind(s) : v;
+  },
+});
+
+// 7-day free trial on every new Merchant Gate subscription. The rest of the
+// codebase already treats a `trialing` subscription as fully valid —
+// /api/rider/issue and /api/verify both check ACTIVE_STATUSES = {"active",
+// "trialing"} — so a merchant can mint riders immediately during the trial,
+// no separate trial-specific gating needed. /api/provision's completion
+// check (session.status === "complete") also already covers a $0-due
+// trial checkout, since that's independent of whether payment was
+// collected upfront.
+const TRIAL_PERIOD_DAYS = 7;
+
+export async function createCheckoutSession(params: {
+  priceId: string;
+  meteredPriceId?: string;
+  successUrl: string;
+  cancelUrl: string;
+  customerEmail?: string;
+}) {
+  // Metered/usage-based prices must not carry a `quantity` — Stripe derives
+  // it from reported meter events, not from the line item.
+  const line_items: Stripe.Checkout.SessionCreateParams.LineItem[] = [
+    { price: params.priceId, quantity: 1 },
+  ];
+  if (params.meteredPriceId) line_items.push({ price: params.meteredPriceId });
+
+  return stripe.checkout.sessions.create({
+    mode: "subscription",
+    line_items,
+    subscription_data: { trial_period_days: TRIAL_PERIOD_DAYS },
+    success_url: params.successUrl,
+    cancel_url: params.cancelUrl,
+    customer_email: params.customerEmail,
+  });
+}
+
+// Credits buy-in — a one-time payment, not a subscription. Uses inline
+// price_data instead of a dashboard-created Price (unlike Merchant Gate)
+// since the amount is chosen per-purchase, not fixed. participant_id +
+// credits ride in session metadata so the webhook knows who to credit and
+// how much without a second round trip.
+export async function createCreditsCheckoutSession(params: {
+  participantId: string;
+  credits: number;
+  usdCents: number;
+  successUrl: string;
+  cancelUrl: string;
+}) {
+  return stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Agent^Rider credits (${params.credits} AGC)` },
+          unit_amount: params.usdCents,
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: {
+      kind: "credits_purchase",
+      participant_id: params.participantId,
+      credits: String(params.credits),
+    },
+    success_url: params.successUrl,
+    cancel_url: params.cancelUrl,
+  });
+}
+
+export async function retrieveSession(sessionId: string) {
+  return stripe.checkout.sessions.retrieve(sessionId, {
+    expand: ["customer", "subscription"],
+  });
+}
+
+export async function retrieveSubscription(subscriptionId: string) {
+  return stripe.subscriptions.retrieve(subscriptionId);
+}
+
+export async function updateSubscriptionMetadata(
+  subscriptionId: string,
+  metadata: Record<string, string>
+) {
+  return stripe.subscriptions.update(subscriptionId, { metadata });
+}
+
+// Stripe's Search API is eventually consistent — a subscription written
+// moments ago may not be found for a few seconds.
+export async function findSubscriptionByMerchantKey(key: string) {
+  const result = await stripe.subscriptions.search({
+    query: `metadata['merchant_key']:'${key}'`,
+  });
+  return result.data[0] ?? null;
+}
+
+// Reports one billable /api/verify call above the free tier to Stripe's
+// Billing Meters API. Requires a Meter named STRIPE_VERIFY_METER_NAME to
+// exist in the Stripe dashboard with a metered Price attached to it, added
+// as a second subscription item on the merchant's Merchant Gate
+// subscription — that wiring is a one-time dashboard/checkout step, not
+// something this call can create on its own. Until METER_NAME is set this
+// is a deliberate no-op so free-tier verification keeps working unmetered.
+const VERIFY_METER_NAME = process.env.STRIPE_VERIFY_METER_NAME;
+
+export async function reportVerifyOverage(customerId: string): Promise<void> {
+  if (!VERIFY_METER_NAME || !customerId) return;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: VERIFY_METER_NAME,
+      payload: { stripe_customer_id: customerId, value: "1" },
+    });
+  } catch (err) {
+    // Fail open — a metering hiccup must never block a merchant's
+    // verification call.
+    console.error("reportVerifyOverage failed", (err as Error).message);
+  }
+}
+
+// ── Toll 1 / Toll 2 meters (behind feature flags; no-op until env wired) ─────
+// Dashboard: create Billing Meters named STRIPE_RIDER_VERIFY_METER_NAME and
+// STRIPE_CAPABILITY_LOOKUP_METER_NAME, attach metered Prices, then set env.
+// Until names are set these are deliberate no-ops (same fail-open as verify).
+
+const RIDER_VERIFY_METER_NAME = process.env.STRIPE_RIDER_VERIFY_METER_NAME;
+const CAPABILITY_LOOKUP_METER_NAME = process.env.STRIPE_CAPABILITY_LOOKUP_METER_NAME;
+
+/** Toll 1 — one billable rider-JWT verify above free tier (0.5¢). */
+export async function reportRiderVerifyOverage(customerId: string): Promise<void> {
+  if (!RIDER_VERIFY_METER_NAME || !customerId) return;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: RIDER_VERIFY_METER_NAME,
+      payload: { stripe_customer_id: customerId, value: "1" },
+    });
+  } catch (err) {
+    console.error("reportRiderVerifyOverage failed", (err as Error).message);
+  }
+}
+
+/** Toll 2 — one billable capability lookup request (2¢). */
+export async function reportCapabilityLookup(customerId: string): Promise<void> {
+  if (!CAPABILITY_LOOKUP_METER_NAME || !customerId) return;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: CAPABILITY_LOOKUP_METER_NAME,
+      payload: { stripe_customer_id: customerId, value: "1" },
+    });
+  } catch (err) {
+    console.error("reportCapabilityLookup failed", (err as Error).message);
+  }
+}
+
+// ── Tollkeeper Tolls 3–7 meters (behind feature flags; no-op until env wired)
+// Dashboard: create Billing Meters named per below, attach metered Prices,
+// then set env. Until names are set these are deliberate no-ops (fail-open,
+// same as Toll 1/2). Meters stay no-op until env wired — no real charging.
+
+const TOLL3_ESCROW_METER_NAME = process.env.STRIPE_TOLL3_ESCROW_METER_NAME;
+const TOLL4_GRANT_ISSUE_METER_NAME = process.env.STRIPE_TOLL4_GRANT_ISSUE_METER_NAME;
+const TOLL4_GRANT_CHECK_METER_NAME = process.env.STRIPE_TOLL4_GRANT_CHECK_METER_NAME;
+const TOLL5_CHECK_METER_NAME = process.env.STRIPE_TOLL5_CHECK_METER_NAME;
+const TOLL6_BOND_STAKE_METER_NAME = process.env.STRIPE_TOLL6_BOND_STAKE_METER_NAME;
+const TOLL6_AUDIT_EXPORT_METER_NAME = process.env.STRIPE_TOLL6_AUDIT_EXPORT_METER_NAME;
+const TOLL7_MEMORY_TRANSFER_METER_NAME = process.env.STRIPE_TOLL7_MEMORY_TRANSFER_METER_NAME;
+
+async function reportTollMeter(
+  meterName: string | undefined,
+  customerId: string,
+  label: string
+): Promise<void> {
+  if (!meterName || !customerId) return;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: meterName,
+      payload: { stripe_customer_id: customerId, value: "1" },
+    });
+  } catch (err) {
+    console.error(`${label} failed`, (err as Error).message);
+  }
+}
+
+/** Toll 3 — one escrow lock (1% routing fee accounted at lock). */
+export async function reportToll3Escrow(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL3_ESCROW_METER_NAME, customerId, "reportToll3Escrow");
+}
+
+/** Toll 4 — one grant issuance (1¢). */
+export async function reportToll4GrantIssue(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL4_GRANT_ISSUE_METER_NAME, customerId, "reportToll4GrantIssue");
+}
+
+/** Toll 4 — one grant check (0.5¢). */
+export async function reportToll4GrantCheck(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL4_GRANT_CHECK_METER_NAME, customerId, "reportToll4GrantCheck");
+}
+
+/** Toll 5 — one exactness attestation check (10¢). */
+export async function reportToll5Check(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL5_CHECK_METER_NAME, customerId, "reportToll5Check");
+}
+
+/** Toll 6 — one bond stake (1% of bonded value, metered). */
+export async function reportToll6BondStake(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL6_BOND_STAKE_METER_NAME, customerId, "reportToll6BondStake");
+}
+
+/** Toll 6 — one audit-trail export (5¢). */
+export async function reportToll6AuditExport(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL6_AUDIT_EXPORT_METER_NAME, customerId, "reportToll6AuditExport");
+}
+
+/** Toll 7 — one hosted memory transfer (2¢). */
+export async function reportToll7MemoryTransfer(customerId: string): Promise<void> {
+  return reportTollMeter(TOLL7_MEMORY_TRANSFER_METER_NAME, customerId, "reportToll7MemoryTransfer");
+}
